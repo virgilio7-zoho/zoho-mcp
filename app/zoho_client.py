@@ -3,23 +3,17 @@ from .config import ANALYTICS_BASE, OWNER_ORG
 from .zoho_oauth import ZohoOAuth
 
 def run_sql(workspace: str, view: str, sql: str) -> dict:
-    """
-    Para SQL, Zoho recomienda NO incluir la vista en la ruta:
-      /api/{OWNER_ORG}/{WORKSPACE}
-    y pasar el FROM "Vista" dentro del ZOHO_SQLQUERY.
-    Así evitamos problemas con espacios/tildes en el path.
-    """
+    # SQL API endpoint
+    url = f"{ANALYTICS_BASE}/api/{OWNER_ORG}/{workspace}/sql"
     access_token = ZohoOAuth.get_access_token()
-
-    # Endpoint SOLO con workspace (no agregamos la vista en la URL)
-    url = f"{ANALYTICS_BASE}/api/{OWNER_ORG}/{workspace}"
-
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+
     form = {
         "ZOHO_ACTION": "EXPORT",
         "ZOHO_OUTPUT_FORMAT": "JSON",
         "ZOHO_API_VERSION": "1.0",
         "ZOHO_SQLQUERY": sql,
+        "ZOHO_ERROR_FORMAT": "JSON",  # opcional, mejora mensajes
     }
 
     try:

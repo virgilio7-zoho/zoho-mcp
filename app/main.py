@@ -1,38 +1,59 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
-from .config import VIEW as DEFAULT_VIEW
+import os
+
+from .config import VIEW as DEFAULT_VIEW, WORKSPACE as DEFAULT_WORKSPACE
 from .zoho_client import run_sql
 
 app = FastAPI(
     title="Zoho Analytics MCP",
-    version="1.0.0",
-    description="HTTP MCP para consultar Zoho Analytics con SQL seguro."
+    version="1.1.0",
+    description="HTTP MCP para consultar Zoho Analytics (errores claros + debug)."
 )
 
 class SQLRequest(BaseModel):
     sql: str = Field(..., description="Consulta SQL para Zoho Analytics")
-    view: Optional[str] = Field(default=None, description="Tabla/Vista (por defecto, la de config)")
+    view: Optional[str] = Field(default=None, description="Tabla/Vista destino")
+    workspace: Optional[str] = Field(default=None, description="Workspace destino")
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.get("/debug/env")
+def debug_env():
+    # Muestra qué variables están presentes (no revela sus valores)
+    def present(name): return "set" if os.getenv(name) else "missing"
+    return {
+        "ZOHO_ACCOUNTS_BASE": present("ZOHO_ACCOUNTS_BASE"),
+        "ZOHO_ANALYTICS_API_BASE": present("ZOHO_ANALYTICS_API_BASE"),
+        "ZOHO_CLIENT_ID": present("ZOHO_CLIENT_ID"),
+        "ZOHO_CLIENT_SECRET": present("ZOHO_CLIENT_SECRET"),
+        "ZOHO_REFRESH_TOKEN": present("ZOHO_REFRESH_TOKEN"),
+        "ZOHO_OWNER_ORG": present("ZOHO_OWNER_ORG"),
+        "ZOHO_WORKSPACE": present("ZOHO_WORKSPACE"),
+        "ZOHO_VIEW": present("ZOHO_VIEW"),
+        # Compatibilidad con tus nombres antiguos:
+        "ANALYTICS_CLIENT_ID": present("ANALYTICS_CLIENT_ID"),
+        "ANALYTICS_CLIENT_SECRET": present("ANALYTICS_CLIENT_SECRET"),
+        "ANALYTICS_REFRESH_TOKEN": present("ANALYTICS_REFRESH_TOKEN"),
+        "ANALYTICS_ORG_ID": present("ANALYTICS_ORG_ID"),
+        "ACCOUNTS_SERVER_URL": present("ACCOUNTS_SERVER_URL"),
+        "ANALYTICS_SERVER_URL": present("ANALYTICS_SERVER_URL"),
+    }
+
 @app.post("/query")
 def query_sql(body: SQLRequest):
     view = body.view or DEFAULT_VIEW
-    data = run_sql(view=view, sql=body.sql)
-    return {"status": "ok", "view": view, "rows": data}
+    workspace = body.workspace or DEFAULT_WORKSPACE
+    if not workspace or not view:
+        raise HTTPException(status_code=400, detail="Falta 'workspace' o 'view' (envíalos en el body o configura defaults).")
+    try:
+        data = run_sql(workspace=workspace, view=view, sql=body.sql)
+        return {"status": "ok", "workspace": workspace, "view": view, "rows": data}
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"App error: {e.__class__.__name__}")
 
-class GroupSumRequest(BaseModel):
-    view: Optional[str] = None
-    group_col: str
-    sum_col: str
-    limit: Optional[int] = 100
-
-@app.post("/helpers/group_sum")
-def group_sum(body: GroupSumRequest):
-    view = body.view or DEFAULT_VIEW
-    sql = f'SELECT "{body.group_col}", SUM("{body.sum_col}") FROM "{view}" GROUP BY "{body.group_col}" LIMIT {body.limit}'
-    data = run_sql(view=view, sql=sql)
-    return {"status": "ok", "view": view, "rows": data}

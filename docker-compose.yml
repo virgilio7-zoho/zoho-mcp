@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  zoho-mcp:
+    build: .
+    image: ghcr.io/youruser/zoho-mcp:latest
+    ports:
+      - "8000:8000"
+    environment:
+      ZOHO_ACCOUNTS_BASE: "https://accounts.zoho.com"
+      ZOHO_ANALYTICS_API_BASE: "https://analyticsapi.zoho.com"
+      ZOHO_CLIENT_ID: "${ZOHO_CLIENT_ID}"
+      ZOHO_CLIENT_SECRET: "${ZOHO_CLIENT_SECRET}"
+      ZOHO_REFRESH_TOKEN: "${ZOHO_REFRESH_TOKEN}"
+      ZOHO_OWNER_ORG: "${ZOHO_OWNER_ORG}"
+      ZOHO_WORKSPACE: "${ZOHO_WORKSPACE}"
+      ZOHO_VIEW: "${ZOHO_VIEW}"
+    restart: unless-stopped

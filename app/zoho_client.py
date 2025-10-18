@@ -3,17 +3,21 @@ from .config import ANALYTICS_BASE, OWNER_ORG
 from .zoho_oauth import ZohoOAuth
 
 def run_sql(workspace: str, view: str, sql: str) -> dict:
-    # SQL API endpoint
-    url = f"{ANALYTICS_BASE}/api/{OWNER_ORG}/{workspace}/sql"
+    """
+    Versión alineada con la documentación oficial de Zoho Analytics MCP Server:
+      - Usa SQLEXPORT como acción.
+      - Llama al endpoint /api/{OWNER_ORG}/{WORKSPACE}.
+    """
     access_token = ZohoOAuth.get_access_token()
-    headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+    url = f"{ANALYTICS_BASE}/api/{OWNER_ORG}/{workspace}"
 
+    headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
     form = {
-        "ZOHO_ACTION": "EXPORT",
+        "ZOHO_ACTION": "SQLEXPORT",        # <-- Clave: acción correcta para SQL
         "ZOHO_OUTPUT_FORMAT": "JSON",
         "ZOHO_API_VERSION": "1.0",
         "ZOHO_SQLQUERY": sql,
-        "ZOHO_ERROR_FORMAT": "JSON",  # opcional, mejora mensajes
+        "ZOHO_ERROR_FORMAT": "JSON"
     }
 
     try:

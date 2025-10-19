@@ -15,7 +15,7 @@ def run_sql(workspace: str, view: str, sql: str) -> dict:
         raise RuntimeError("Falta ORG ID (ANALYTICS_ORG_ID o ZOHO_OWNER_ORG).")
 
     # Endpoint: orgId + workspaceName (no uses el workspaceId largo)
-    url = f"{base}/api/{org}/{workspace}"
+    url = f"{base}/api/{org}/{workspace}/sql"
 
     access_token = ZohoOAuth.get_access_token()
     headers = {

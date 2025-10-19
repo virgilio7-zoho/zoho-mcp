@@ -70,6 +70,29 @@ def list_views(workspace: str):
     except Exception:
         return {"status": resp.status_code, "text": resp.text[:400]}
 
+from pydantic import BaseModel
+
+# --- NUEVO: esquema de request para /view ---
+class ViewRequest(BaseModel):
+    workspace: str
+    view: str
+    limit: int | None = 100
+    offset: int | None = 0
+    columns: str | None = None    # ej: "Mes,Ventas,Region"
+    criteria: str | None = None   # ej: "Region = 'Norte'"
+
+@app.post("/view", summary="Read data from a view (REST v2)")
+def view_data(req: ViewRequest):
+    from .zoho_client import get_view_data
+    data = get_view_data(
+        workspace=req.workspace,
+        view=req.view,
+        limit=req.limit or 100,
+        offset=req.offset or 0,
+        columns=req.columns,
+        criteria=req.criteria,
+    )
+    return data
 
 @app.post("/query")
 def query_sql(body: SQLRequest):

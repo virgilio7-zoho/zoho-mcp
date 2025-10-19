@@ -1,163 +1,126 @@
 from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional
 import os
 import requests
 
-# ---------------------------
-# FastAPI app & CORS
-# ---------------------------
-app = FastAPI(title="Zoho Analytics MCP", version="1.0.0")
+from .zoho_client import (
+    get_view_data,
+    smart_view_export,
+    run_sql,
+    sql_export,
+)
+from .zoho_oauth import ZohoOAuth
 
+
+app = FastAPI(title="Zoho MCP API", version="1.0.0")
+
+# CORS amplio para pruebas desde navegador / ChatGPT MCP
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ajusta si quieres restringir
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------
-# Health / root
-# ---------------------------
-@app.get("/", summary="Root")
-def root():
-    return {"status": "ok", "service": "zoho-mcp"}
+# ---------- Modelos ----------
+class ViewBody(BaseModel):
+    workspace: str = Field(..., description="Nombre del workspace (p.ej. MARKEM)")
+    view: str = Field(..., description="Nombre exacto de la vista/tabla en Zoho (respetar mayúsculas/espacios)")
+    limit: int = Field(100, ge=1, le=10000)
+    offset: int = Field(0, ge=0)
+    columns: Optional[str] = Field(None, description="Lista de columnas separadas por coma (opcional)")
+    criteria: Optional[str] = Field(None, description="Criterio de filtro (opcional)")
+    workspace_id: Optional[str] = Field(None, description="ID del workspace (opcional)")
 
-@app.get("/health", summary="Healthcheck")
+class QueryBody(BaseModel):
+    workspace: str = Field(..., description="Nombre del workspace (p.ej. MARKEM)")
+    view: Optional[str] = Field(None, description="Ignorado por Zoho SQL; se mantiene por compatibilidad")
+    sql: str = Field(..., description="Consulta SQL Zoho (ej.: SELECT 1 FROM \"MiVista\")")
+
+
+# ---------- Endpoints ----------
+@app.get("/", summary="Bienvenida")
+def root():
+    return {"status": "ok", "message": "Zoho MCP API up"}
+
+@app.get("/health", summary="Healthcheck simple")
 def health():
     return {"status": "ok"}
 
-# ---------------------------
-# Modelos de entrada
-# ---------------------------
-class QueryRequest(BaseModel):
-    sql: str
-    view: str
-    workspace: str
+@app.get("/debug/token", summary="Devuelve si hay token válido (no el token)")
+def debug_token():
+    try:
+        token = ZohoOAuth.get_access_token()
+        return {"has_token": bool(token), "len": len(token) if token else 0}
+    except Exception as e:
+        return {"error": str(e)}
 
-class ViewRequest(BaseModel):
-    workspace: str
-    view: str
-    limit: Optional[int] = 100
-    offset: Optional[int] = 0
-    columns: Optional[str] = None     # "Mes,Ventas,Region"
-    criteria: Optional[str] = None    # "Mes = '2024-09'"
-    workspace_id: Optional[str] = None  # "2086177000000002085" (opcional)
-
-class SmartViewReq(BaseModel):
-    workspace: str
-    view: str
-    limit: Optional[int] = 100
-    offset: Optional[int] = 0
-    columns: Optional[str] = None
-    criteria: Optional[str] = None
-    workspace_id: Optional[str] = None
-
-# ---------------------------
-# Endpoints principales
-# ---------------------------
-@app.post("/query", summary="Run SQL (SQLEXPORT)")
-def query(req: QueryRequest):
-    # run_sql es un alias hacia sql_export(workspace, sql) definido en zoho_client
-    from .zoho_client import run_sql
-    result = run_sql(req.workspace, req.view, req.sql)
-    return result
-
-@app.post("/view", summary="Read data from a view (auto, alias)")
-def view_data(req: ViewRequest):
-    # get_view_data es un alias que delega a smart_view_export(...)
-    from .zoho_client import get_view_data
+@app.post("/view", summary="Obtiene datos de una vista/tabla (auto legacy/v2, firma simple)")
+def view_data(body: ViewBody):
     data = get_view_data(
-        workspace=req.workspace,
-        view=req.view,
-        limit=req.limit or 100,
-        offset=req.offset or 0,
-        columns=req.columns,
-        criteria=req.criteria,
-        workspace_id=req.workspace_id,
+        workspace=body.workspace,
+        view=body.view,
+        limit=body.limit,
+        offset=body.offset,
+        columns=body.columns,
+        criteria=body.criteria,
+        workspace_id=body.workspace_id,
     )
     return data
 
-@app.post("/view_smart", summary="Fetch view data (auto-detect API flavor)")
-def view_smart(req: SmartViewReq):
-    from .zoho_client import smart_view_export
+@app.post("/view_smart", summary="Obtiene datos de una vista/tabla (detector completo de rutas)")
+def view_smart(body: ViewBody):
     data = smart_view_export(
-        workspace=req.workspace,
-        view=req.view,
-        limit=req.limit or 100,
-        offset=req.offset or 0,
-        columns=req.columns,
-        criteria=req.criteria,
-        workspace_id=req.workspace_id,
+        workspace=body.workspace,
+        view=body.view,
+        limit=body.limit,
+        offset=body.offset,
+        columns=body.columns,
+        criteria=body.criteria,
+        workspace_id=body.workspace_id,
     )
     return data
 
-# ---------------------------
-# Endpoints de depuración
-# ---------------------------
-@app.get("/debug/env", summary="Show selected environment variables")
-def debug_env():
-    keys = [
-        "ANALYTICS_SERVER_URL",
-        "ANALYTICS_ORG_ID",
-        "ACCOUNTS_SERVER_URL",
-        "ZOHO_ANALYTICS_API_BASE",
-        # NO exponemos client_secret/refresh_token por seguridad
-    ]
-    return {k: os.getenv(k) for k in keys}
+@app.post("/query", summary="Ejecuta SQL con SQLEXPORT (legacy)")
+def query_sql(body: QueryBody):
+    # Mantener compatibilidad con código existente que importaba run_sql
+    return run_sql(workspace=body.workspace, view=body.view or "", sql=body.sql)
 
-@app.get("/debug/workspaces", summary="List workspaces (REST v2)")
-def list_workspaces():
-    # Intenta ambas bases v2 para mayor compatibilidad
-    base = (os.getenv("ANALYTICS_SERVER_URL") or "https://analyticsapi.zoho.com").rstrip("/")
-    from .zoho_oauth import ZohoOAuth
-    token = ZohoOAuth.get_access_token()
-    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
-
-    urls = [f"{base}/restapi/v2/workspaces", f"{base}/api/v2/workspaces"]
-    last = None
-    for url in urls:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            last = (url, resp.status_code, resp.text[:600])
-            if resp.status_code < 400:
-                return resp.json()
-        except Exception as e:
-            last = (url, "EXC", str(e))
-            continue
-    return {"status": "failure", "last": last}
-
-@app.get("/debug/views", summary="List views/tables in a workspace (REST v2)")
-def list_views(
-    workspace: str = Query(..., description="Name of workspace (e.g., MARKEM)"),
-    workspace_id: Optional[str] = Query(None, description="Optional workspace id (e.g., 2086177000000002085)")
+# ---------- (Opcional) Listado legacy para confirmar nombres exactos ----------
+@app.get("/debug/legacy_list", summary="Lista views/tables (legacy LISTVIEWS/LISTTABLES)")
+def legacy_list(
+    workspace: str = Query(..., description="Nombre del workspace (ej. MARKEM)"),
+    owner_or_org: str = Query("owner", description="'owner' (default) o 'org'"),
 ):
     base = (os.getenv("ANALYTICS_SERVER_URL") or "https://analyticsapi.zoho.com").rstrip("/")
-    from .zoho_oauth import ZohoOAuth
+    org = os.getenv("ANALYTICS_ORG_ID")
+    owner = os.getenv("ANALYTICS_OWNER_NAME")
+
+    ws_enc = requests.utils.requote_uri(workspace)
+    if owner_or_org == "owner" and owner:
+        head = f"{base}/api/{requests.utils.requote_uri(owner)}/{ws_enc}"
+    elif org:
+        head = f"{base}/api/{org}/{ws_enc}"
+    else:
+        return {"status": "failure", "error": "Falta ANALYTICS_OWNER_NAME o ANALYTICS_ORG_ID"}
+
     token = ZohoOAuth.get_access_token()
-    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
-    ws_segment = workspace_id if workspace_id else workspace
-    urls = [
-        f"{base}/restapi/v2/workspaces/{ws_segment}/views",
-        f"{base}/restapi/v2/workspaces/{ws_segment}/tables",
-        f"{base}/api/v2/workspaces/{ws_segment}/views",
-        f"{base}/api/v2/workspaces/{ws_segment}/tables",
-    ]
-    out = []
-    last = None
-    for url in urls:
+    def call(url, form):
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            last = (url, resp.status_code, resp.text[:400])
-            if resp.status_code < 400:
-                out.append({"url": url, "data": resp.json()})
+            r = requests.post(url, headers=headers, data=form, timeout=60)
+            return {"url": url, "status": r.status_code, "body": r.text[:1200]}
         except Exception as e:
-            last = (url, "EXC", str(e))
-            continue
+            return {"url": url, "error": str(e)}
 
-    if out:
-        return {"status": "success", "results": out}
-    return {"status": "failure", "last": last}
+    out = []
+    out.append(call(f"{head}", {"ZOHO_ACTION": "LISTVIEWS", "ZOHO_OUTPUT_FORMAT": "JSON"}))
+    out.append(call(f"{head}", {"ZOHO_ACTION": "LISTTABLES", "ZOHO_OUTPUT_FORMAT": "JSON"}))
+    return {"results": out}

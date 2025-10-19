@@ -1,26 +1,28 @@
 import os
 import requests
 from .zoho_oauth import ZohoOAuth
+from urllib.parse import quote
+
 def get_view_data(workspace: str, view: str, limit: int = 100, offset: int = 0,
                   columns: str | None = None, criteria: str | None = None,
                   workspace_id: str | None = None) -> dict:
     """
     Lee datos de una vista/tabla usando Zoho Analytics REST API v2.
-    Intenta las variantes:
-      /restapi/v2/workspaces/{workspace}/views/{view}/data
-      /restapi/v2/workspaces/{workspace}/tables/{view}/data
-    También permite pasar workspace_id (numérico) por si el tenant lo exige.
+    Codifica (URL-encode) los segmentos de ruta para nombres con espacios/caracteres especiales.
+    Prueba ambas variantes: /views/... y /tables/...
     """
     base = os.getenv("ANALYTICS_SERVER_URL", "https://analyticsapi.zoho.com").rstrip("/")
     org  = os.getenv("ANALYTICS_ORG_ID") or os.getenv("ZOHO_OWNER_ORG")
     token = ZohoOAuth.get_access_token()
 
-    # Usa nombre o id de workspace según lo que se pase
+    # Usa nombre o id; codifica para la URL
     ws_segment = workspace_id if workspace_id else workspace
+    ws_enc     = quote(str(ws_segment), safe="")   # ← importante
+    view_enc   = quote(str(view),       safe="")   # ← importante
 
     headers = {
         "Authorization": f"Zoho-oauthtoken {token}",
-        "ZANALYTICS-ORGID": str(org),  # <--- CLAVE en muchos tenants
+        "ZANALYTICS-ORGID": str(org),
     }
     params = {
         "limit": int(limit),
@@ -31,10 +33,9 @@ def get_view_data(workspace: str, view: str, limit: int = 100, offset: int = 0,
     if criteria:
         params["criteria"] = criteria
 
-    # Intentos en orden
     paths = [
-        f"/restapi/v2/workspaces/{ws_segment}/views/{view}/data",
-        f"/restapi/v2/workspaces/{ws_segment}/tables/{view}/data",
+        f"/restapi/v2/workspaces/{ws_enc}/views/{view_enc}/data",
+        f"/restapi/v2/workspaces/{ws_enc}/tables/{view_enc}/data",
     ]
 
     last_error = None
@@ -45,7 +46,6 @@ def get_view_data(workspace: str, view: str, limit: int = 100, offset: int = 0,
         resp = requests.get(url, headers=headers, params=params, timeout=60)
 
         if resp.status_code in (401, 403):
-            # refresca token e intenta 1 vez
             ZohoOAuth.clear()
             headers["Authorization"] = f"Zoho-oauthtoken {ZohoOAuth.get_access_token()}"
             resp = requests.get(url, headers=headers, params=params, timeout=60)
@@ -56,7 +56,6 @@ def get_view_data(workspace: str, view: str, limit: int = 100, offset: int = 0,
             last_error = (url, resp.status_code, resp.text[:600])
             continue
 
-        # Éxito
         return resp.json()
 
     url, status, body = last_error if last_error else ("", "", "")

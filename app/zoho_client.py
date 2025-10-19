@@ -169,3 +169,13 @@ def sql_export(workspace: str, sql: str) -> dict:
         resp.raise_for_status()
     print("[SMART][SQL] ✅ OK:", url)
     return resp.json()
+# ============================================================
+# 🔁 COMPAT: alias para el import que espera main.py
+# ============================================================
+
+def run_sql(workspace: str, view: str, sql: str) -> dict:
+    """
+    Alias de compatibilidad para el código existente en main.py que importaba run_sql.
+    Ignora 'view' (no es necesario para SQLEXPORT) y usa sql_export() internamente.
+    """
+    return sql_export(workspace, sql)

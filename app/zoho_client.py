@@ -125,8 +125,10 @@ def smart_view_export(
                 last_err = (url, resp.status_code, resp.text[:600])
                 print("[SMART][B] ❌ ERR", last_err)
 
-    # ---------- C) Legacy API (ORG_ID y OWNER_NAME) ----------
-    # Paginación legacy: usa rango [start, end)
+        # ---------- C) Legacy API (ORG_ID y OWNER_NAME) ----------
+    # En legacy v1 la URL correcta para EXPORT es:
+    #   POST {base}/api/{OWNER_o_ORG}/{workspace}/{view_o_table}
+    #  (sin 'views/' ni 'tables/' en el path)
     form = {
         "ZOHO_ACTION": "EXPORT",
         "ZOHO_OUTPUT_FORMAT": "JSON",
@@ -141,28 +143,45 @@ def smart_view_export(
         form["ZOHO_CRITERIA"] = criteria
 
     owner = _owner_name()
-    legacy_bases = [f"{base}/api/{org}/{ws_name_enc}"]  # por ORG_ID
+    ws_name_enc = quote(str(workspace), safe="")
+    view_enc = quote(str(view), safe="")
+
+    # Construimos bases legacy por ORG y por OWNER (si hay owner)
+    legacy_bases = [f"{base}/api/{org}/{ws_name_enc}"]
     if owner:
         owner_enc = quote(owner, safe="")
-        legacy_bases.append(f"{base}/api/{owner_enc}/{ws_name_enc}")  # por OWNER_NAME
+        legacy_bases = [f"{base}/api/{owner_enc}/{ws_name_enc}"] + legacy_bases  # probamos OWNER primero
 
+    # 1) PRUEBA SIMPLE (sin 'views/' ni 'tables/') -> LA CORRECTA EN LEGACY
+    for legacy_base in legacy_bases:
+        url = f"{legacy_base}/{view_enc}"
+        print("[SMART] Try C1:", url, "(EXPORT JSON, simple path)")
+        def _do(h):
+            return requests.post(url, headers=h, data=form, timeout=60)
+        resp = _retry_once(_do)
+        if resp.status_code < 400:
+            print("[SMART][C1] ✅ OK:", url)
+            return resp.json()
+        last_err = (url, resp.status_code, resp.text[:600])
+        print("[SMART][C1] ❌ ERR", last_err)
+
+    # 2) FALLBACK (con 'tables/' y 'views/') -> por si el tenant tuviera una variante
     for legacy_base in legacy_bases:
         for kind in ("tables", "views"):
             url = f"{legacy_base}/{kind}/{view_enc}"
-            print("[SMART] Try C:", url, "(EXPORT JSON)")
+            print("[SMART] Try C2:", url, "(EXPORT JSON, with segment)")
             def _do(h):
                 return requests.post(url, headers=h, data=form, timeout=60)
             resp = _retry_once(_do)
             if resp.status_code < 400:
-                print("[SMART][C] ✅ OK:", url)
+                print("[SMART][C2] ✅ OK:", url)
                 return resp.json()
             last_err = (url, resp.status_code, resp.text[:600])
-            print("[SMART][C] ❌ ERR", last_err)
+            print("[SMART][C2] ❌ ERR", last_err)
 
-    # Si nada funcionó, devolvemos el último error detallado
+    # Si nada funcionó:
     url, status, body = last_err if last_err else ("", "", "")
     raise RuntimeError(f"smart_view_export failed. Last tried: {url} status={status} body={body}")
-
 
 # ============================================================
 # 🧠 SQL export (SQLEXPORT) con fallback por ORG_ID y OWNER_NAME

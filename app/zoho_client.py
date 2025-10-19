@@ -5,23 +5,27 @@ from .zoho_oauth import ZohoOAuth
 
 
 # ============================================================
-# 🔐 FUNCIONES BASE DE AUTENTICACIÓN Y UTILIDADES
+# 🔐 Autenticación & utilidades
 # ============================================================
 
-def _org_id():
+def _org_id() -> str:
     org = os.getenv("ANALYTICS_ORG_ID") or os.getenv("ZOHO_OWNER_ORG")
     if not org:
-        raise RuntimeError("Falta ANALYTICS_ORG_ID o ZOHO_OWNER_ORG")
-    return str(org)
+        raise RuntimeError("Falta ANALYTICS_ORG_ID o ZOHO_OWNER_ORG en variables de entorno.")
+    return str(org).strip()
 
-def _base():
+def _owner_name() -> str | None:
+    owner = os.getenv("ANALYTICS_OWNER_NAME")
+    return owner.strip() if owner else None
+
+def _base() -> str:
     return (
         os.getenv("ANALYTICS_SERVER_URL")
         or os.getenv("ZOHO_ANALYTICS_API_BASE")
         or "https://analyticsapi.zoho.com"
     ).rstrip("/")
 
-def _auth_headers(include_org=True):
+def _auth_headers(include_org: bool = True) -> dict:
     token = ZohoOAuth.get_access_token()
     headers = {
         "Authorization": f"Zoho-oauthtoken {token}",
@@ -31,18 +35,20 @@ def _auth_headers(include_org=True):
         headers["ZANALYTICS-ORGID"] = _org_id()
     return headers
 
-def _retry_once(func):
-    """Ejecuta la función (petición) una vez y reintenta si da 401/403 (token expirado)."""
-    resp = func()
+def _retry_once(do_request):
+    """
+    Ejecuta la petición y, si recibe 401/403 (token expirado), refresca y reintenta 1 vez.
+    `do_request` debe aceptar opcionalmente un dict de headers: do_request(new_headers)
+    """
+    resp = do_request(_auth_headers())
     if resp.status_code in (401, 403):
         ZohoOAuth.clear()
-        hdrs = _auth_headers()
-        resp = func(hdrs)
+        resp = do_request(_auth_headers())
     return resp
 
 
 # ============================================================
-# 🚀 FUNCIÓN PRINCIPAL: SMART EXPORT
+# 🚀 Exportación de datos por vista (auto-detector de API)
 # ============================================================
 
 def smart_view_export(
@@ -55,18 +61,29 @@ def smart_view_export(
     workspace_id: str | None = None,
 ) -> dict:
     """
-    Intenta automáticamente todas las rutas conocidas hasta encontrar la que funcione:
-      A) REST v2 (bases /restapi/v2 o /api/v2) usando workspaceName
-      B) REST v2 usando workspaceId
-      C) Legacy API (/api/{ORG}/{workspace}/tables|views/{view}) con EXPORT JSON
+    Intenta automáticamente todas las variantes conocidas de Zoho Analytics hasta que una funcione:
+
+      A) REST v2 con nombre de workspace:
+         {base}/restapi/v2/workspaces/{workspace}/views|tables/{view}/data
+         {base}/api/v2/workspaces/{workspace}/views|tables/{view}/data
+
+      B) REST v2 con ID de workspace:
+         {base}/restapi/v2/workspaces/{workspaceId}/views|tables/{view}/data
+         {base}/api/v2/workspaces/{workspaceId}/views|tables/{view}/data
+
+      C) Legacy API por ORG_ID y por OWNER_NAME:
+         POST {base}/api/{ORG_ID}/{workspace}/tables|views/{view}
+         POST {base}/api/{OWNER_NAME}/{workspace}/tables|views/{view}
+         (con ZOHO_ACTION=EXPORT → JSON)
     """
     base = _base()
     org = _org_id()
-    ws_name_enc = quote(str(workspace), safe="")
-    ws_id_enc = quote(str(workspace_id), safe="") if workspace_id else None
-    view_enc = quote(str(view), safe="")
 
-    def _params():
+    ws_name_enc = quote(str(workspace), safe="")
+    ws_id_enc   = quote(str(workspace_id), safe="") if workspace_id else None
+    view_enc    = quote(str(view), safe="")
+
+    def _params() -> dict:
         p = {"limit": int(limit), "offset": int(offset)}
         if columns:
             p["columns"] = columns
@@ -74,41 +91,42 @@ def smart_view_export(
             p["criteria"] = criteria
         return p
 
-    # Bases posibles (algunos tenants usan /api/v2, otros /restapi/v2)
+    # Algunos tenants exponen /restapi/v2, otros /api/v2
     v2_bases = [f"{base}/restapi/v2", f"{base}/api/v2"]
 
     last_err = None
 
-    # ---------- A) REST v2 usando nombre ----------
+    # ---------- A) REST v2 con nombre ----------
     for v2 in v2_bases:
         for kind in ("views", "tables"):
             url = f"{v2}/workspaces/{ws_name_enc}/{kind}/{view_enc}/data"
             print("[SMART] Try A:", url)
-            def do(h=_auth_headers()):
+            def _do(h):
                 return requests.get(url, headers=h, params=_params(), timeout=60)
-            resp = _retry_once(do)
+            resp = _retry_once(_do)
             if resp.status_code < 400:
                 print("[SMART][A] ✅ OK:", url)
                 return resp.json()
             last_err = (url, resp.status_code, resp.text[:600])
             print("[SMART][A] ❌ ERR", last_err)
 
-    # ---------- B) REST v2 usando workspace ID ----------
+    # ---------- B) REST v2 con workspace ID ----------
     if ws_id_enc:
         for v2 in v2_bases:
             for kind in ("views", "tables"):
                 url = f"{v2}/workspaces/{ws_id_enc}/{kind}/{view_enc}/data"
                 print("[SMART] Try B:", url)
-                def do(h=_auth_headers()):
+                def _do(h):
                     return requests.get(url, headers=h, params=_params(), timeout=60)
-                resp = _retry_once(do)
+                resp = _retry_once(_do)
                 if resp.status_code < 400:
                     print("[SMART][B] ✅ OK:", url)
                     return resp.json()
                 last_err = (url, resp.status_code, resp.text[:600])
                 print("[SMART][B] ❌ ERR", last_err)
 
-    # ---------- C) Legacy API /api/{ORG}/{workspace}/tables|views/{view} ----------
+    # ---------- C) Legacy API (ORG_ID y OWNER_NAME) ----------
+    # Paginación legacy: usa rango [start, end)
     form = {
         "ZOHO_ACTION": "EXPORT",
         "ZOHO_OUTPUT_FORMAT": "JSON",
@@ -122,35 +140,44 @@ def smart_view_export(
     if criteria:
         form["ZOHO_CRITERIA"] = criteria
 
-    for kind in ("tables", "views"):
-        url = f"{base}/api/{org}/{ws_name_enc}/{kind}/{view_enc}"
-        print("[SMART] Try C:", url, "(EXPORT JSON)")
-        def do(h=_auth_headers()):
-            return requests.post(url, headers=h, data=form, timeout=60)
-        resp = _retry_once(do)
-        if resp.status_code < 400:
-            print("[SMART][C] ✅ OK:", url)
-            return resp.json()
-        last_err = (url, resp.status_code, resp.text[:600])
-        print("[SMART][C] ❌ ERR", last_err)
+    owner = _owner_name()
+    legacy_bases = [f"{base}/api/{org}/{ws_name_enc}"]  # por ORG_ID
+    if owner:
+        owner_enc = quote(owner, safe="")
+        legacy_bases.append(f"{base}/api/{owner_enc}/{ws_name_enc}")  # por OWNER_NAME
 
-    # Si nada funcionó, devuelve error
+    for legacy_base in legacy_bases:
+        for kind in ("tables", "views"):
+            url = f"{legacy_base}/{kind}/{view_enc}"
+            print("[SMART] Try C:", url, "(EXPORT JSON)")
+            def _do(h):
+                return requests.post(url, headers=h, data=form, timeout=60)
+            resp = _retry_once(_do)
+            if resp.status_code < 400:
+                print("[SMART][C] ✅ OK:", url)
+                return resp.json()
+            last_err = (url, resp.status_code, resp.text[:600])
+            print("[SMART][C] ❌ ERR", last_err)
+
+    # Si nada funcionó, devolvemos el último error detallado
     url, status, body = last_err if last_err else ("", "", "")
     raise RuntimeError(f"smart_view_export failed. Last tried: {url} status={status} body={body}")
 
 
 # ============================================================
-# 🧠 OPCIONAL: SQL EXPORT
+# 🧠 SQL export (SQLEXPORT) con fallback por ORG_ID y OWNER_NAME
 # ============================================================
 
 def sql_export(workspace: str, sql: str) -> dict:
     """
-    Ejecuta un SQL en Zoho Analytics vía API legacy /api/{ORG}/{workspace}/sql con SQLEXPORT.
+    Ejecuta SQL usando la API legacy:
+      POST {base}/api/{ORG_ID}/{workspace}/sql
+      POST {base}/api/{OWNER_NAME}/{workspace}/sql
+    con ZOHO_ACTION=SQLEXPORT → JSON
     """
     base = _base()
     org = _org_id()
     ws_enc = quote(str(workspace), safe="")
-    url = f"{base}/api/{org}/{ws_enc}/sql"
 
     form = {
         "ZOHO_ACTION": "SQLEXPORT",
@@ -160,18 +187,29 @@ def sql_export(workspace: str, sql: str) -> dict:
         "ZOHO_ERROR_FORMAT": "JSON",
     }
 
-    print("[SMART] Try SQL:", url)
-    def do(h=_auth_headers()):
-        return requests.post(url, headers=h, data=form, timeout=60)
-    resp = _retry_once(do)
-    if resp.status_code >= 400:
+    urls = [f"{base}/api/{org}/{ws_enc}/sql"]  # por ORG_ID
+    owner = _owner_name()
+    if owner:
+        owner_enc = quote(owner, safe="")
+        urls.append(f"{base}/api/{owner_enc}/{ws_enc}/sql")  # por OWNER_NAME
+
+    last = None
+    for url in urls:
+        print("[SMART] Try SQL:", url)
+        def _do(h):
+            return requests.post(url, headers=h, data=form, timeout=60)
+        resp = _retry_once(_do)
+        if resp.status_code < 400:
+            print("[SMART][SQL] ✅ OK:", url)
+            return resp.json()
         print("[SMART][SQL] ❌ ERR", resp.status_code, resp.text[:600])
-        resp.raise_for_status()
-    print("[SMART][SQL] ✅ OK:", url)
-    return resp.json()
+        last = (url, resp.status_code, resp.text[:600])
+
+    raise requests.HTTPError(f"SQL failed. Last: {last}")
+
 
 # ============================================================
-# 🔁 COMPAT: alias para los imports esperados por main.py
+# 🔁 Aliases de compatibilidad para main.py existente
 # ============================================================
 
 def get_view_data(
@@ -199,7 +237,6 @@ def get_view_data(
 def run_sql(workspace: str, view: str, sql: str) -> dict:
     """
     Alias de compatibilidad: main.py aún importa run_sql.
-    Ignora 'view' y usa sql_export() por debajo.
+    Ignora 'view' (no es requerido por Zoho para SQLEXPORT) y usa sql_export().
     """
     return sql_export(workspace, sql)
-

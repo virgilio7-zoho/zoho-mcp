@@ -1,6 +1,47 @@
 import os
 import requests
 from .zoho_oauth import ZohoOAuth
+# --- NUEVO: leer datos de una vista (REST v2) ---
+def get_view_data(workspace: str, view: str, limit: int = 100, offset: int = 0,
+                  columns: str | None = None, criteria: str | None = None) -> dict:
+    """
+    Lee datos de una vista usando Zoho Analytics REST API v2:
+      GET {base}/restapi/v2/workspaces/{workspace}/views/{view}/data
+    Soporta columnas, criteria (filtros), limit y offset.
+    """
+    base = os.getenv("ANALYTICS_SERVER_URL", "https://analyticsapi.zoho.com").rstrip("/")
+    token = ZohoOAuth.get_access_token()
+
+    # OJO: los nombres deben ser EXACTOS (workspace y view)
+    url = f"{base}/restapi/v2/workspaces/{workspace}/views/{view}/data"
+
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    params = {
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    if columns:
+        params["columns"] = columns          # p.ej.: Mes, Ventas, Region
+    if criteria:
+        params["criteria"] = criteria        # p.ej.: "Mes = '2024-09'"
+
+    print("[DEBUG] View URL:", url)
+    print("[DEBUG] Params:", params)
+
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+
+    # si token expiró, reintenta 1 vez
+    if resp.status_code in (401, 403):
+        ZohoOAuth.clear()
+        headers["Authorization"] = f"Zoho-oauthtoken {ZohoOAuth.get_access_token()}"
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+
+    if resp.status_code >= 400:
+        print("[ERROR] HTTP:", resp.status_code)
+        print("[ERROR] Body:", resp.text[:600])
+        resp.raise_for_status()
+
+    return resp.json()
 
 def run_sql(workspace: str, view: str, sql: str) -> dict:
     """

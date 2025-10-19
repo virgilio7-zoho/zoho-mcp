@@ -38,7 +38,7 @@ def _auth_headers(include_org: bool = True) -> dict:
 def _retry_once(do_request):
     """
     Ejecuta la petición y, si recibe 401/403 (token expirado), refresca y reintenta 1 vez.
-    `do_request` debe aceptar opcionalmente un dict de headers: do_request(new_headers)
+    `do_request` debe aceptar un dict de headers: do_request(headers)
     """
     resp = do_request(_auth_headers())
     if resp.status_code in (401, 403):
@@ -71,9 +71,9 @@ def smart_view_export(
          {base}/restapi/v2/workspaces/{workspaceId}/views|tables/{view}/data
          {base}/api/v2/workspaces/{workspaceId}/views|tables/{view}/data
 
-      C) Legacy API por ORG_ID y por OWNER_NAME:
-         POST {base}/api/{ORG_ID}/{workspace}/tables|views/{view}
-         POST {base}/api/{OWNER_NAME}/{workspace}/tables|views/{view}
+      C) Legacy API (EXPORT) por OWNER_NAME (si existe) y por ORG_ID:
+         POST {base}/api/{OWNER}/{workspace}/{view}
+         POST {base}/api/{ORG}/{workspace}/{view}
          (con ZOHO_ACTION=EXPORT → JSON)
     """
     base = _base()
@@ -125,15 +125,18 @@ def smart_view_export(
                 last_err = (url, resp.status_code, resp.text[:600])
                 print("[SMART][B] ❌ ERR", last_err)
 
-        # ---------- C) Legacy API (ORG_ID y OWNER_NAME) ----------
-    # En legacy v1 la URL correcta para EXPORT es:
-    #   POST {base}/api/{OWNER_o_ORG}/{workspace}/{view_o_table}
-    #  (sin 'views/' ni 'tables/' en el path)
+    # ---------- C) Legacy API (OWNER primero, luego ORG) ----------
+    # En legacy v1 la URL correcta para EXPORT normalmente es:
+    #   POST {base}/api/{OWNER_o_ORG}/{workspace}/{view}
+    # y requiere en el form: ZOHO_ACTION=EXPORT, ZOHO_DB_NAME, ZOHO_VIEW_NAME
+    # Además, NO enviar ZANALYTICS-ORGID en headers (algunos tenants fallan si se envía).
     form = {
         "ZOHO_ACTION": "EXPORT",
         "ZOHO_OUTPUT_FORMAT": "JSON",
         "ZOHO_ERROR_FORMAT": "JSON",
         "ZOHO_API_VERSION": "1.0",
+        "ZOHO_DB_NAME": str(workspace),
+        "ZOHO_VIEW_NAME": str(view),
         "ZOHO_START_INDEX": int(offset),
         "ZOHO_END_INDEX": int(offset) + int(limit),
     }
@@ -143,36 +146,46 @@ def smart_view_export(
         form["ZOHO_CRITERIA"] = criteria
 
     owner = _owner_name()
-    ws_name_enc = quote(str(workspace), safe="")
-    view_enc = quote(str(view), safe="")
-
-    # Construimos bases legacy por ORG y por OWNER (si hay owner)
-    legacy_bases = [f"{base}/api/{org}/{ws_name_enc}"]
+    legacy_bases = []
     if owner:
         owner_enc = quote(owner, safe="")
-        legacy_bases = [f"{base}/api/{owner_enc}/{ws_name_enc}"] + legacy_bases  # probamos OWNER primero
+        legacy_bases.append(f"{base}/api/{owner_enc}/{ws_name_enc}")  # OWNER primero
+    legacy_bases.append(f"{base}/api/{org}/{ws_name_enc}")             # luego ORG
 
-    # 1) PRUEBA SIMPLE (sin 'views/' ni 'tables/') -> LA CORRECTA EN LEGACY
+    def _legacy_headers():
+        token = ZohoOAuth.get_access_token()
+        return {
+            "Authorization": f"Zoho-oauthtoken {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+    # 1) PRUEBA SIMPLE (sin 'views/' ni 'tables/') -> la correcta en la mayoría de tenants legacy
     for legacy_base in legacy_bases:
         url = f"{legacy_base}/{view_enc}"
         print("[SMART] Try C1:", url, "(EXPORT JSON, simple path)")
-        def _do(h):
-            return requests.post(url, headers=h, data=form, timeout=60)
-        resp = _retry_once(_do)
+        def _do():
+            return requests.post(url, headers=_legacy_headers(), data=form, timeout=120)
+        resp = _do()
+        if resp.status_code in (401, 403):
+            ZohoOAuth.clear()
+            resp = _do()
         if resp.status_code < 400:
             print("[SMART][C1] ✅ OK:", url)
             return resp.json()
         last_err = (url, resp.status_code, resp.text[:600])
         print("[SMART][C1] ❌ ERR", last_err)
 
-    # 2) FALLBACK (con 'tables/' y 'views/') -> por si el tenant tuviera una variante
+    # 2) FALLBACK (con 'tables/' y 'views/') -> por si el tenant lo exige
     for legacy_base in legacy_bases:
         for kind in ("tables", "views"):
             url = f"{legacy_base}/{kind}/{view_enc}"
             print("[SMART] Try C2:", url, "(EXPORT JSON, with segment)")
-            def _do(h):
-                return requests.post(url, headers=h, data=form, timeout=60)
-            resp = _retry_once(_do)
+            def _do():
+                return requests.post(url, headers=_legacy_headers(), data=form, timeout=120)
+            resp = _do()
+            if resp.status_code in (401, 403):
+                ZohoOAuth.clear()
+                resp = _do()
             if resp.status_code < 400:
                 print("[SMART][C2] ✅ OK:", url)
                 return resp.json()
@@ -183,20 +196,22 @@ def smart_view_export(
     url, status, body = last_err if last_err else ("", "", "")
     raise RuntimeError(f"smart_view_export failed. Last tried: {url} status={status} body={body}")
 
+
 # ============================================================
-# 🧠 SQL export (SQLEXPORT) con fallback por ORG_ID y OWNER_NAME
+# 🧠 SQL export (SQLEXPORT) con fallback por OWNER y ORG
 # ============================================================
 
 def sql_export(workspace: str, sql: str) -> dict:
     """
     Ejecuta SQL usando la API legacy:
-      POST {base}/api/{ORG_ID}/{workspace}/sql
       POST {base}/api/{OWNER_NAME}/{workspace}/sql
+      POST {base}/api/{ORG_ID}/{workspace}/sql
     con ZOHO_ACTION=SQLEXPORT → JSON
     """
     base = _base()
     org = _org_id()
     ws_enc = quote(str(workspace), safe="")
+    owner = _owner_name()
 
     form = {
         "ZOHO_ACTION": "SQLEXPORT",
@@ -204,20 +219,29 @@ def sql_export(workspace: str, sql: str) -> dict:
         "ZOHO_API_VERSION": "1.0",
         "ZOHO_SQLQUERY": sql,
         "ZOHO_ERROR_FORMAT": "JSON",
+        "ZOHO_DB_NAME": str(workspace),   # por si el tenant lo exige
     }
 
-    urls = [f"{base}/api/{org}/{ws_enc}/sql"]  # por ORG_ID
-    owner = _owner_name()
+    def _legacy_headers():
+        token = ZohoOAuth.get_access_token()
+        return {
+            "Authorization": f"Zoho-oauthtoken {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+    urls = []
     if owner:
         owner_enc = quote(owner, safe="")
-        urls.append(f"{base}/api/{owner_enc}/{ws_enc}/sql")  # por OWNER_NAME
+        urls.append(f"{base}/api/{owner_enc}/{ws_enc}/sql")
+    urls.append(f"{base}/api/{org}/{ws_enc}/sql")
 
     last = None
     for url in urls:
         print("[SMART] Try SQL:", url)
-        def _do(h):
-            return requests.post(url, headers=h, data=form, timeout=60)
-        resp = _retry_once(_do)
+        resp = requests.post(url, headers=_legacy_headers(), data=form, timeout=120)
+        if resp.status_code in (401, 403):
+            ZohoOAuth.clear()
+            resp = requests.post(url, headers=_legacy_headers(), data=form, timeout=120)
         if resp.status_code < 400:
             print("[SMART][SQL] ✅ OK:", url)
             return resp.json()

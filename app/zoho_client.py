@@ -169,13 +169,37 @@ def sql_export(workspace: str, sql: str) -> dict:
         resp.raise_for_status()
     print("[SMART][SQL] ✅ OK:", url)
     return resp.json()
+
 # ============================================================
-# 🔁 COMPAT: alias para el import que espera main.py
+# 🔁 COMPAT: alias para los imports esperados por main.py
 # ============================================================
+
+def get_view_data(
+    workspace: str,
+    view: str,
+    limit: int = 100,
+    offset: int = 0,
+    columns: str | None = None,
+    criteria: str | None = None,
+    workspace_id: str | None = None,
+) -> dict:
+    """
+    Alias de compatibilidad: conserva la firma que usa main.py y delega en smart_view_export().
+    """
+    return smart_view_export(
+        workspace=workspace,
+        view=view,
+        limit=limit,
+        offset=offset,
+        columns=columns,
+        criteria=criteria,
+        workspace_id=workspace_id,
+    )
 
 def run_sql(workspace: str, view: str, sql: str) -> dict:
     """
-    Alias de compatibilidad para el código existente en main.py que importaba run_sql.
-    Ignora 'view' (no es necesario para SQLEXPORT) y usa sql_export() internamente.
+    Alias de compatibilidad: main.py aún importa run_sql.
+    Ignora 'view' y usa sql_export() por debajo.
     """
     return sql_export(workspace, sql)
+

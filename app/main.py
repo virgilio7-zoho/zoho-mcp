@@ -1,126 +1,70 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional
 import os
-import requests
+import logging
+from fastapi import FastAPI, Body, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from app.zoho_client import smart_view_export, iter_rows_ndjson
 
-from .zoho_client import (
-    get_view_data,
-    smart_view_export,
-    run_sql,
-    sql_export,
-)
-from .zoho_oauth import ZohoOAuth
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("api")
 
+app = FastAPI(title="Zoho MCP")
 
-app = FastAPI(title="Zoho MCP API", version="1.0.0")
-
-# CORS amplio para pruebas desde navegador / ChatGPT MCP
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Modelos ----------
-class ViewBody(BaseModel):
-    workspace: str = Field(..., description="Nombre del workspace (p.ej. MARKEM)")
-    view: str = Field(..., description="Nombre exacto de la vista/tabla en Zoho (respetar mayúsculas/espacios)")
-    limit: int = Field(100, ge=1, le=10000)
+class ViewSmartReq(BaseModel):
+    owner: str = Field(..., description="Ej: vacevedo@markem.com.co")
+    workspace: str = Field(..., description="Workspace (tal cual en Zoho)")
+    view: str = Field(..., description="Vista/tabla exacta (con espacios si aplica)")
+    limit: int = Field(100, ge=1, le=1000)
     offset: int = Field(0, ge=0)
-    columns: Optional[str] = Field(None, description="Lista de columnas separadas por coma (opcional)")
-    criteria: Optional[str] = Field(None, description="Criterio de filtro (opcional)")
-    workspace_id: Optional[str] = Field(None, description="ID del workspace (opcional)")
 
-class QueryBody(BaseModel):
-    workspace: str = Field(..., description="Nombre del workspace (p.ej. MARKEM)")
-    view: Optional[str] = Field(None, description="Ignorado por Zoho SQL; se mantiene por compatibilidad")
-    sql: str = Field(..., description="Consulta SQL Zoho (ej.: SELECT 1 FROM \"MiVista\")")
+class StreamReq(BaseModel):
+    owner: str
+    workspace: str
+    view: str
+    page_size: int = Field(1000, ge=10, le=5000)
+    filename: str | None = Field(default=None, description="Nombre del archivo a descargar")
 
-
-# ---------- Endpoints ----------
-@app.get("/", summary="Bienvenida")
+@app.get("/")
 def root():
-    return {"status": "ok", "message": "Zoho MCP API up"}
-
-@app.get("/health", summary="Healthcheck simple")
-def health():
     return {"status": "ok"}
 
-@app.get("/debug/token", summary="Devuelve si hay token válido (no el token)")
-def debug_token():
+# Página única (pequeña) — útil para pruebas/UI
+@app.post("/view_smart")
+def view_smart(req: ViewSmartReq = Body(...)):
     try:
-        token = ZohoOAuth.get_access_token()
-        return {"has_token": bool(token), "len": len(token) if token else 0}
+        data = smart_view_export(
+            owner=req.owner,
+            workspace=req.workspace,
+            view=req.view,
+            limit=req.limit,
+            offset=req.offset,
+        )
+        return JSONResponse(content=data)
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/view", summary="Obtiene datos de una vista/tabla (auto legacy/v2, firma simple)")
-def view_data(body: ViewBody):
-    data = get_view_data(
-        workspace=body.workspace,
-        view=body.view,
-        limit=body.limit,
-        offset=body.offset,
-        columns=body.columns,
-        criteria=body.criteria,
-        workspace_id=body.workspace_id,
-    )
-    return data
-
-@app.post("/view_smart", summary="Obtiene datos de una vista/tabla (detector completo de rutas)")
-def view_smart(body: ViewBody):
-    data = smart_view_export(
-        workspace=body.workspace,
-        view=body.view,
-        limit=body.limit,
-        offset=body.offset,
-        columns=body.columns,
-        criteria=body.criteria,
-        workspace_id=body.workspace_id,
-    )
-    return data
-
-@app.post("/query", summary="Ejecuta SQL con SQLEXPORT (legacy)")
-def query_sql(body: QueryBody):
-    # Mantener compatibilidad con código existente que importaba run_sql
-    return run_sql(workspace=body.workspace, view=body.view or "", sql=body.sql)
-
-# ---------- (Opcional) Listado legacy para confirmar nombres exactos ----------
-@app.get("/debug/legacy_list", summary="Lista views/tables (legacy LISTVIEWS/LISTTABLES)")
-def legacy_list(
-    workspace: str = Query(..., description="Nombre del workspace (ej. MARKEM)"),
-    owner_or_org: str = Query("owner", description="'owner' (default) o 'org'"),
-):
-    base = (os.getenv("ANALYTICS_SERVER_URL") or "https://analyticsapi.zoho.com").rstrip("/")
-    org = os.getenv("ANALYTICS_ORG_ID")
-    owner = os.getenv("ANALYTICS_OWNER_NAME")
-
-    ws_enc = requests.utils.requote_uri(workspace)
-    if owner_or_org == "owner" and owner:
-        head = f"{base}/api/{requests.utils.requote_uri(owner)}/{ws_enc}"
-    elif org:
-        head = f"{base}/api/{org}/{ws_enc}"
-    else:
-        return {"status": "failure", "error": "Falta ANALYTICS_OWNER_NAME o ANALYTICS_ORG_ID"}
-
-    token = ZohoOAuth.get_access_token()
-    headers = {
-        "Authorization": f"Zoho-oauthtoken {token}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
-    def call(url, form):
-        try:
-            r = requests.post(url, headers=headers, data=form, timeout=60)
-            return {"url": url, "status": r.status_code, "body": r.text[:1200]}
-        except Exception as e:
-            return {"url": url, "error": str(e)}
-
-    out = []
-    out.append(call(f"{head}", {"ZOHO_ACTION": "LISTVIEWS", "ZOHO_OUTPUT_FORMAT": "JSON"}))
-    out.append(call(f"{head}", {"ZOHO_ACTION": "LISTTABLES", "ZOHO_OUTPUT_FORMAT": "JSON"}))
-    return {"results": out}
+# STREAMING TOTAL como NDJSON — cero picos de memoria
+@app.post("/view_stream")
+def view_stream(req: StreamReq = Body(...)):
+    try:
+        generator = iter_rows_ndjson(
+            owner=req.owner,
+            workspace=req.workspace,
+            view=req.view,
+            page_size=req.page_size,
+        )
+        filename = req.filename or f"{req.view.replace(' ', '_')}.ndjson"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(generator, media_type="application/x-ndjson", headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

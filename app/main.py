@@ -46,18 +46,30 @@ def debug_env():
 def list_workspaces():
     from .zoho_oauth import ZohoOAuth
     import requests, os
-
     token = ZohoOAuth.get_access_token()
-    org = os.getenv("ANALYTICS_ORG_ID") or os.getenv("ZOHO_OWNER_ORG")
     base = os.getenv("ANALYTICS_SERVER_URL") or os.getenv("ZOHO_ANALYTICS_API_BASE")
     url = f"{base}/restapi/v2/workspaces"
-
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
     resp = requests.get(url, headers=headers, timeout=30)
     try:
         return resp.json()
     except Exception:
         return {"status": resp.status_code, "text": resp.text[:400]}
+
+@app.get("/debug/views")
+def list_views(workspace: str):
+    from .zoho_oauth import ZohoOAuth
+    import requests, os
+    token = ZohoOAuth.get_access_token()
+    base = os.getenv("ANALYTICS_SERVER_URL") or os.getenv("ZOHO_ANALYTICS_API_BASE")
+    url = f"{base}/restapi/v2/workspaces/{workspace}/tables"
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    try:
+        return resp.json()
+    except Exception:
+        return {"status": resp.status_code, "text": resp.text[:400]}
+
 
 @app.post("/query")
 def query_sql(body: SQLRequest):

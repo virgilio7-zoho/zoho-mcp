@@ -72,14 +72,14 @@ def list_views(workspace: str):
 
 from pydantic import BaseModel
 
-# --- NUEVO: esquema de request para /view ---
 class ViewRequest(BaseModel):
     workspace: str
     view: str
     limit: int | None = 100
     offset: int | None = 0
-    columns: str | None = None    # ej: "Mes,Ventas,Region"
-    criteria: str | None = None   # ej: "Region = 'Norte'"
+    columns: str | None = None
+    criteria: str | None = None
+    workspace_id: str | None = None  # <-- NUEVO (opcional)
 
 @app.post("/view", summary="Read data from a view (REST v2)")
 def view_data(req: ViewRequest):
@@ -91,9 +91,9 @@ def view_data(req: ViewRequest):
         offset=req.offset or 0,
         columns=req.columns,
         criteria=req.criteria,
+        workspace_id=req.workspace_id,   # <-- NUEVO
     )
     return data
-
 @app.post("/query")
 def query_sql(body: SQLRequest):
     view = body.view or DEFAULT_VIEW

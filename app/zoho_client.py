@@ -1,98 +1,97 @@
+# app/zoho_client.py
 import os
-import logging
-import requests
 import json
-from typing import Dict, Any, Iterable, Tuple
+import time
+import urllib.parse
+import requests
 
-LOGGER = logging.getLogger("zoho")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+ZOHO_DC = os.getenv("ZOHO_DC", "com").strip() or "com"
+BASE_REST = f"https://analyticsapi.zoho.{ZOHO_DC}"
+USER_AGENT = "zoho-mcp/1.0 (+render)"
 
-ANALYTICS_BASE = os.getenv("ZOHO_ANALYTICS_BASE", "https://analyticsapi.zoho.com")
-ACCESS_TOKEN = os.getenv("ZOHO_ACCESS_TOKEN")  # “Zoho-oauthtoken xxx”
-TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))  # s
-MAX_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
+class ZohoAuthError(RuntimeError): ...
+class ZohoApiError(RuntimeError): ...
 
-def _auth_header() -> Dict[str, str]:
-    if not ACCESS_TOKEN:
-        raise RuntimeError("Falta ZOHO_ACCESS_TOKEN en variables de entorno.")
-    return {"Authorization": f"Zoho-oauthtoken {ACCESS_TOKEN}"}
+def _access_token() -> str:
+    token = os.getenv("ZOHO_ACCESS_TOKEN")
+    if not token:
+        raise ZohoAuthError("Falta ZOHO_ACCESS_TOKEN en variables de entorno.")
+    return token.strip()
 
-def _export_sql_payload(view_name: str, limit: int, offset: int) -> Dict[str, str]:
-    safe_view = view_name.replace('"', '\\"')
-    sql = f'SELECT * FROM "{safe_view}" LIMIT {limit} OFFSET {offset}'
+def _auth_headers():
     return {
-        "ZOHO_ACTION": "EXPORT",
-        "ZOHO_OUTPUT_FORMAT": "JSON",
-        "ZOHO_ERROR_FORMAT": "JSON",
-        "ZOHO_API_VERSION": "1.0",
-        "ZOHO_AUTO_IDENTIFY": "true",
-        "ZOHO_COLUMN_FORMAT": "JSON",
-        "ZOHO_SQL": sql,
+        "Authorization": f"Zoho-oauthtoken {_access_token()}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
     }
 
-def smart_view_export(owner: str, workspace: str, view: str, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+def _get(url: str, params=None):
+    r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
+    return r.status_code, r.text
+
+def _post(url: str, data=None, form=False):
+    headers = _auth_headers()
+    if form:
+        r = requests.post(url, headers=headers, data=data, timeout=120)
+    else:
+        headers["Content-Type"] = "application/json"
+        r = requests.post(url, headers=headers, json=data, timeout=120)
+    return r.status_code, r.text
+
+def smart_view_export(owner: str, orgowner: str, workspace: str, view: str,
+                      limit: int = 100, offset: int = 0) -> dict:
     """
-    Exporta con API clásico + SQL paginado. Devuelve solo la página pedida.
+    Estrategia:
+      1) Rutas REST v2 (views/tables)  -> suelen fallar con 404/400
+      2) Ruta EXPORT JSON 'simple path' -> /api/{owner}/{ws}/{view}
+    Devuelve dict con: columns, rows, source_url
     """
-    url = f"{ANALYTICS_BASE}/api/{owner}/{workspace}/{requests.utils.quote(view, safe='')}"
-    payload = _export_sql_payload(view, limit, offset)
+    view_enc = urllib.parse.quote(view, safe="")
+    ws_enc = urllib.parse.quote(workspace, safe="")
 
-    last_err: Tuple[int, str] | None = None
-    for attempt in range(MAX_RETRIES + 1):
-        LOGGER.info("[SMART] Export SQL: %s  (limit=%s offset=%s) try=%s",
-                    url, limit, offset, attempt + 1)
-        r = requests.post(
-            url,
-            headers={**_auth_header(), "Accept": "application/json"},
-            data=payload,  # API clásico usa form-encoded
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            return r.json()
-        last_err = (r.status_code, r.text[:600])
-        if r.status_code >= 500:
-            LOGGER.warning("[SMART] 5xx: %s  body=%s", r.status_code, r.text[:300])
-            continue
-        break
+    trials = []
 
-    code, body = last_err if last_err else (0, "no response")
-    raise RuntimeError(f"smart_view_export failed: {url} status={code} body={body}")
+    # A) REST v2 (views)
+    url = f"{BASE_REST}/restapi/v2/workspaces/{ws_enc}/views/{view_enc}/data"
+    status, body = _get(url, params={"limit": limit, "offset": offset})
+    if status == 200:
+        payload = json.loads(body)
+        cols = payload.get("columns", [])
+        rows = payload.get("rows", [])
+        return {"columns": cols, "rows": rows, "source_url": url}
+    trials.append(("A-views", url, status, body[:400]))
 
-# --------- STREAMING GRANDES: NDJSON ---------
+    # A2) REST v2 (tables)
+    url = f"{BASE_REST}/restapi/v2/workspaces/{ws_enc}/tables/{view_enc}/data"
+    status, body = _get(url, params={"limit": limit, "offset": offset})
+    if status == 200:
+        payload = json.loads(body)
+        cols = payload.get("columns", [])
+        rows = payload.get("rows", [])
+        return {"columns": cols, "rows": rows, "source_url": url}
+    trials.append(("A-tables", url, status, body[:400]))
 
-def iter_rows_ndjson(owner: str, workspace: str, view: str, page_size: int = 1000) -> Iterable[str]:
-    """
-    Itera todo el dataset en páginas y emite NDJSON (una línea por fila).
-    No guarda todas las filas en memoria: transforma y YIELD línea por línea.
-    """
-    if page_size <= 0:
-        page_size = 1000
+    # C1) EXPORT JSON simple path (este es el que te funcionó)
+    # Nota: aquí NO va /data ni /export, es el recurso directo.
+    owner_enc = urllib.parse.quote(owner, safe="")
+    url = f"{BASE_REST}/api/{owner_enc}/{ws_enc}/{view_enc}"
+    status, body = _get(url, params={"ZOHO_OUTPUT_FORMAT": "json"})
+    if status == 200:
+        payload = json.loads(body)
+        # El formato de EXPORT trae 'response/results/columns/rows' típico
+        resp = payload.get("response", {})
+        results = resp.get("result", resp.get("results", {}))
+        columns = results.get("column_order") or results.get("columns") or []
+        rows = results.get("rows") or results.get("data") or []
+        return {"columns": columns, "rows": rows, "source_url": url}
+    trials.append(("C1-export", url, status, body[:400]))
 
-    offset = 0
-    total = 0
-    while True:
-        js = smart_view_export(owner, workspace, view, limit=page_size, offset=offset)
-        # Estructura típica del API clásico (EXPORT JSON)
-        # {"response":{"result":{"column_order":[...], "rows":[ [...], [...], ... ]}}}
-        try:
-            result = js["response"]["result"]
-            cols = result["column_order"]
-            rows = result.get("rows", [])
-        except Exception as e:
-            raise RuntimeError(f"Estructura inesperada de respuesta: {e}; sample={str(js)[:400]}")
+    # Si nada funcionó, lanza error con diagnóstico corto
+    diag = "\n".join([f"[{k}] {u} -> {s} {b}" for (k, u, s, b) in trials])
+    raise ZohoApiError(f"smart_view_export failed.\n{diag}")
 
-        if not rows:
-            break
-
-        for row in rows:
-            # row puede venir como lista alineada a column_order
-            if isinstance(row, dict):
-                obj = row
-            else:
-                obj = {cols[i]: row[i] if i < len(row) else None for i in range(len(cols))}
-            yield json.dumps(obj, ensure_ascii=False) + "\n"
-
-        got = len(rows)
-        total += got
-        offset += got
-        LOGGER.info("[STREAM] view=%s page_size=%s got=%s total=%s", view, page_size, got, total)
+# Atajo que usa el endpoint /view_smart
+def view_smart(owner: str, orgowner: str, workspace: str, workspace_id: str,
+               view: str, limit: int = 100, offset: int = 0) -> dict:
+    # workspace_id hoy no es estrictamente necesario para la ruta C1.
+    return smart_view_export(owner, orgowner, workspace, view, limit, offset)

@@ -408,8 +408,16 @@ TOOL_DEFINITIONS: list[dict] = [
 @app.post("/mcp")
 async def mcp_invoke(request: Request):
     try:
-        data = await request.json()
+        # Attempt to parse the request body as JSON. Some MCP clients may send
+        # an empty body as part of connection checks. In that case, treat
+        # ``data`` as an empty dict rather than raising a parse error.
+        body_bytes = await request.body()
+        if not body_bytes:
+            data = {}
+        else:
+            data = json.loads(body_bytes.decode())
     except Exception:
+        # Could not parse JSON; return a standard JSON-RPC parse error
         return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
 
     # --- JSON‑RPC 2.0 handling ---
@@ -422,6 +430,19 @@ async def mcp_invoke(request: Request):
         if method == "tools/list":
             result = {"tools": TOOL_DEFINITIONS}
             return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": result}
+
+        # Initialization handshake
+        # According to the MCP lifecycle, clients send an ``initialize``
+        # request to negotiate capabilities before using the server. We
+        # respond with minimal capabilities indicating that tools are
+        # supported and that the list does not change dynamically.
+        if method == "initialize":
+            capabilities = {
+                "tools": {"listChanged": False},
+                "resources": {"listChanged": False},
+                "prompts": {"listChanged": False},
+            }
+            return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": {"capabilities": capabilities}}
 
         # Tool execution
         if method == "tools/call":

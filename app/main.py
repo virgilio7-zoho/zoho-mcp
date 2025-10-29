@@ -21,6 +21,7 @@ See ``config.py`` for the list of variables and their descriptions.
 """
 
 from fastapi import FastAPI, Query, Body, Request
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -406,19 +407,47 @@ TOOL_DEFINITIONS: list[dict] = [
 # inspects the incoming payload to determine which protocol is being used
 # and returns the appropriate response format.
 @app.post("/mcp")
-async def mcp_invoke(request: Request):
-    try:
-        # Attempt to parse the request body as JSON. Some MCP clients may send
-        # an empty body as part of connection checks. In that case, treat
-        # ``data`` as an empty dict rather than raising a parse error.
-        body_bytes = await request.body()
-        if not body_bytes:
-            data = {}
-        else:
-            data = json.loads(body_bytes.decode())
-    except Exception:
-        # Could not parse JSON; return a standard JSON-RPC parse error
-        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
+async def mcp_invoke(
+    payload: Optional[dict] = Body(
+        default=None,
+        description=(
+            "JSON‑RPC request payload. For MCP clients this should contain a "
+            "`jsonrpc` version, a `method` such as `initialize`, `tools/list` "
+            "or `tools/call`, an `id`, and optionally `params`."
+        ),
+    ),
+    request: Request = None,
+):
+    """
+    Invoke MCP methods or execute simple actions.
+
+    This endpoint accepts both JSON‑RPC 2.0 messages (used by ChatGPT and other
+    MCP clients) and a simplified `{action, input}` format for backward
+    compatibility. When invoked via Swagger/OpenAPI, provide a JSON‑RPC object
+    in the request body to test tool discovery and execution. For example:
+
+    ```
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "initialize",
+      "params": {}
+    }
+    ```
+    """
+    # Determine the incoming data. If `payload` is provided by FastAPI's body
+    # parser, use it; otherwise fall back to reading the raw request body.
+    if payload is not None:
+        data = payload
+    else:
+        try:
+            body_bytes = await request.body()
+            if not body_bytes:
+                data = {}
+            else:
+                data = json.loads(body_bytes.decode())
+        except Exception:
+            return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
 
     # --- JSON‑RPC 2.0 handling ---
     if isinstance(data, dict) and data.get("jsonrpc") == "2.0":

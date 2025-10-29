@@ -1,9 +1,9 @@
-# app/zoho_client_v2.py
+# app/zoho_client.py
 """
-Cliente Zoho Analytics API v2 (mínimo funcional).
-- Incluye refresco de token con refresh_token
-- Expone v2_export_view y v2_sql_query
-- Usa variables de entorno vía config.py
+Cliente Zoho Analytics API v2 (estable para Render).
+- Refresco automático de access_token con refresh_token
+- Endpoints v2: export view y SQL
+- Usa variables de entorno via pydantic-settings (config.py)
 """
 
 import os
@@ -12,9 +12,9 @@ from urllib.parse import quote
 
 from app.config import settings  # pydantic-settings
 
-# ---------------------------
-# Tokens
-# ---------------------------
+# =========================================================
+# 🔐 Tokens
+# =========================================================
 
 def _refresh_access_token() -> str:
     url = f"{settings.ZOHO_ACCOUNTS_BASE.rstrip('/')}/oauth/v2/token"
@@ -42,20 +42,24 @@ def _get_access_token(force: bool = False) -> str:
     return tok
 
 
-# ---------------------------
-# API v2 helpers
-# ---------------------------
+# =========================================================
+# 🔗 Helpers base v2
+# =========================================================
 
 def _rest_v2_base() -> str:
-    # https://analyticsapi.zoho.com/restapi/v2/...
+    # https://analyticsapi.zoho.com/restapi/v2
     return settings.ZOHO_ANALYTICS_API_BASE.rstrip("/") + "/restapi/v2"
 
 
+# =========================================================
+# 📤 Exportar vista/tabla (API v2)
+# =========================================================
+
 def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 100, offset: int = 0) -> dict:
     """
-    Llama a la API v2 para exportar datos de un view/table.
-    Endpoint sugerido: /workspaces/{workspace_id}/views/{view}/data
-    Si falla por 401, refresca token y reintenta una vez.
+    Exporta datos de un view/table por API v2.
+    Endpoint esperado:
+      GET /restapi/v2/workspaces/{workspace_id}/views/{view}/data?limit=&offset=
     """
     wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
     if not wsid:
@@ -87,11 +91,16 @@ def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 1
     return r.json()
 
 
+# =========================================================
+# 🧪 SQL (API v2)
+# =========================================================
+
 def v2_sql_query(sql: str, *, workspace_id: str | None = None) -> dict:
     """
-    Ejecuta SQL usando API v2 (cuando el endpoint esté habilitado).
-    Endpoint sugerido: /workspaces/{workspace_id}/sql
-    Si tu tenant no lo tiene abierto, puede devolver 404/400.
+    Ejecuta SQL por API v2 (si tu tenant lo tiene habilitado).
+    Endpoint esperado:
+      POST /restapi/v2/workspaces/{workspace_id}/sql
+    Body: { "sql": "SELECT ..." }
     """
     wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
     if not wsid:
@@ -120,6 +129,10 @@ def v2_sql_query(sql: str, *, workspace_id: str | None = None) -> dict:
 
     return r.json()
 
+
+# =========================================================
+# 🩺 Health
+# =========================================================
 
 def health_info() -> dict:
     return {

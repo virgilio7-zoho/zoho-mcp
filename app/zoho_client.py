@@ -383,31 +383,76 @@ def export_view(
     poll_interval = int(os.getenv("ZC_EXPORT_POLL_INTERVAL", "5"))
     timeout_secs = int(os.getenv("ZC_EXPORT_TIMEOUT", "120"))
     start_time = time.time()
-    while True:
-        r_status = requests.get(status_url, headers=_auth_headers(), timeout=60)
-        if r_status.status_code == 401:
-            r_status = requests.get(
-                status_url,
-                headers=_auth_headers(get_access_token(True)),
-                timeout=60,
-            )
-        if r_status.status_code != 200:
-            raise RuntimeError(
-                f"GET {status_url} -> {r_status.status_code} {r_status.text}"
-            )
-        try:
-            status_json = r_status.json()
-        except Exception:
-            status_json = json.loads(r_status.content.decode("utf-8-sig"))
-        status_data = status_json.get("data") or status_json
-        job_status = status_data.get("jobStatus") or status_data.get("status")
-        if job_status and job_status.upper() in {"COMPLETED", "SUCCESS", "FINISHED"}:
-            break
-        if time.time() - start_time > timeout_secs:
-            raise RuntimeError(
-                f"Export job {job_id} did not complete within {timeout_secs} seconds"
-            )
-        time.sleep(poll_interval)
+    # Poll the job status until it completes or times out. If the job does not
+    # finish within the configured timeout, we will later fall back to the
+    # synchronous export API. Wrapping the polling loop in a try/finally block
+    # allows us to handle timeouts gracefully.
+    job_completed = False
+    try:
+        while True:
+            r_status = requests.get(status_url, headers=_auth_headers(), timeout=60)
+            if r_status.status_code == 401:
+                r_status = requests.get(
+                    status_url,
+                    headers=_auth_headers(get_access_token(True)),
+                    timeout=60,
+                )
+            if r_status.status_code != 200:
+                raise RuntimeError(
+                    f"GET {status_url} -> {r_status.status_code} {r_status.text}"
+                )
+            try:
+                status_json = r_status.json()
+            except Exception:
+                status_json = json.loads(r_status.content.decode("utf-8-sig"))
+            status_data = status_json.get("data") or status_json
+            job_status = status_data.get("jobStatus") or status_data.get("status")
+            # Determine completion based on substring match rather than exact equality.
+            # Export jobs return status like "JOB COMPLETED"【225790924013138†L404-L411】 which
+            # should be considered complete. We also treat generic "SUCCESS" and "FINISHED"
+            # statuses as completion.
+            if job_status:
+                s = str(job_status).upper()
+                if "COMPLETED" in s or s in {"SUCCESS", "FINISHED"}:
+                    job_completed = True
+                    break
+            if time.time() - start_time > timeout_secs:
+                break
+            time.sleep(poll_interval)
+    finally:
+        if not job_completed:
+            # If the job didn't complete within the timeout, use the synchronous
+            # export API as a fallback. This avoids returning a 500 error for
+            # small tables where the bulk API might be slow or flaky.
+            path_sync = f"/restapi/v2/workspaces/{workspace_id}/views/{view}/data"
+            sync_params = {"format": "json", "limit": limit, "offset": offset}
+            sync_url = f"{ANALYTICS_SERVER_URL}{path_sync}?{urlencode(sync_params)}"
+            r_sync = requests.get(sync_url, headers=_auth_headers(), timeout=120)
+            if r_sync.status_code == 401:
+                r_sync = requests.get(
+                    sync_url,
+                    headers=_auth_headers(get_access_token(True)),
+                    timeout=120,
+                )
+            if r_sync.status_code != 200:
+                raise RuntimeError(
+                    f"GET {sync_url} -> {r_sync.status_code} {r_sync.text}"
+                )
+            try:
+                sync_data = r_sync.json()
+            except Exception:
+                sync_data = json.loads(r_sync.content.decode("utf-8-sig"))
+            # Slice the rows according to offset/limit
+            def slice_rows(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, list):
+                            obj[k] = v[offset : offset + limit]
+                        elif isinstance(v, dict):
+                            obj[k] = slice_rows(v)
+                    return obj
+                return obj
+            return slice_rows(sync_data)
 
     # Step 3: download the result
     data_path = f"/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}/data"
@@ -547,8 +592,13 @@ def query_data(workspace_id: str, sql: str) -> Dict[str, Any]:
             status_json = json.loads(r_status.content.decode("utf-8-sig"))
         data_section = status_json.get("data") or status_json
         job_status = data_section.get("jobStatus") or data_section.get("status")
-        if job_status and job_status.upper() in {"COMPLETED", "SUCCESS", "FINISHED"}:
-            break
+        # Consider the job complete if the status contains "COMPLETED" (e.g. "JOB COMPLETED")
+        # or matches common success flags. Without this, statuses like "JOB COMPLETED" would
+        # never satisfy the original equality check and cause unnecessary timeouts【225790924013138†L404-L411】.
+        if job_status:
+            s = str(job_status).upper()
+            if "COMPLETED" in s or s in {"SUCCESS", "FINISHED"}:
+                break
         # Check timeout
         if time.time() - start_time > timeout_secs:
             raise RuntimeError(

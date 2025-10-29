@@ -257,60 +257,186 @@ def export_view(
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    """Export data from a view as JSON.
+    """Export data from a view as JSON using the Bulk API.
 
-    Implements GET ``/restapi/v2/workspaces/{workspace_id}/views/{view}/data``
-    with query parameters ``format=json``, ``limit`` and ``offset``. The
-    official API documentation illustrates bulk exports using a ``CONFIG``
-    parameter【215211381353514†L1337-L1343】. However, the simpler synchronous
-    variant used here is sufficient for small data sets and supports
-    pagination via ``limit`` and ``offset``. The returned JSON object
-    contains the exported rows.
+    Zoho Analytics provides two mechanisms to export data from a view:
+
+    * A synchronous endpoint: ``/restapi/v2/workspaces/<workspace-id>/views/<view-id>/data``
+      which accepts ``format``, ``limit`` and ``offset`` query parameters and returns
+      the data inline. This endpoint may return an empty body when invoked on
+      unsupported view types (e.g. dashboards, query tables, live connect
+      workspaces) leading to JSON decode errors. The official documentation
+      recommends using the asynchronous Bulk API for such cases【215211381353514†L1082-L1101】.
+
+    * An asynchronous Bulk API endpoint: ``/restapi/v2/bulk/workspaces/<workspace-id>/views/<view-id>/data``.
+      When called with a ``CONFIG`` parameter specifying ``responseFormat`` (and
+      optionally other export options), the server returns a ``jobId``. The job
+      status can be polled via ``/restapi/v2/bulk/workspaces/<workspace-id>/exportjobs/<jobId>``
+      until it completes, after which the result can be downloaded from
+      ``/restapi/v2/bulk/workspaces/<workspace-id>/exportjobs/<jobId>/data``. This
+      implementation follows that pattern to provide a robust export that works
+      across all view types and large datasets. Pagination (``limit``/``offset``)
+      is implemented client-side by slicing the returned rows.
 
     Parameters
     ----------
     workspace_id : str
-        Workspace identifier. Must not be empty.
+        Identifier of the workspace. Must not be empty.
     view : str
         Identifier or name of the view. Must not be empty.
     limit : int
-        Number of rows to return. Defaults to 100. Maximum allowed by the
-        API is 10,000.
+        Maximum number of rows to return. Defaults to 100. If the underlying
+        export returns more rows, only the first ``limit`` rows after
+        ``offset`` will be included in the result.
     offset : int
-        Starting index for pagination. Defaults to 0.
+        Starting row index for pagination. Defaults to 0.
 
     Returns
     -------
     dict
-        JSON object containing the exported rows.
+        A dictionary containing the exported rows. If the server returns a
+        non‑JSON payload (e.g. a file) or an empty response, a RuntimeError
+        is raised with the underlying HTTP error.
+
+    Raises
+    ------
+    ValueError
+        If either ``workspace_id`` or ``view`` is empty.
+    RuntimeError
+        If any HTTP request fails, the bulk job does not complete within
+        the timeout, or the response cannot be parsed as JSON.
     """
+    import json
+    import time
+
     if not workspace_id or not view:
         raise ValueError("workspace_id y view son obligatorios")
-    path = f"/restapi/v2/workspaces/{workspace_id}/views/{view}/data"
-    params = {"format": "json", "limit": limit, "offset": offset}
-    # Construct full URL manually to include querystring; using params in
-    # requests.get would encode them again when path already includes '?' in some
-    # clients. This approach ensures the query parameters are appended exactly
-    # once.
-    url = f"{ANALYTICS_SERVER_URL}{path}?{urlencode(params)}"
-    r = requests.get(url, headers=_auth_headers(), timeout=120)
+
+    # Step 1: initiate export job using the bulk API. According to the
+    # documentation, passing CONFIG with at least the response format will
+    # create a job and return a jobId【215211381353514†L1082-L1101】. We request
+    # JSON data so that the result can be parsed directly.
+    config = {"responseFormat": "json"}
+    # Construct the initiation URL
+    path_init = f"/restapi/v2/bulk/workspaces/{workspace_id}/views/{view}/data"
+    init_url = f"{ANALYTICS_SERVER_URL}{path_init}"
+    params = {"CONFIG": json.dumps(config)}
+
+    # Initiate the job
+    r = requests.get(init_url, headers=_auth_headers(), params=params, timeout=120)
     if r.status_code == 401:
         r = requests.get(
-            url,
+            init_url,
+            headers=_auth_headers(get_access_token(True)),
+            params=params,
+            timeout=120,
+        )
+    # Some unsupported views may still return HTTP 200 but an empty body or
+    # HTML response. Check status code and content type.
+    if r.status_code != 200:
+        raise RuntimeError(f"GET {init_url} -> {r.status_code} {r.text}")
+    # Parse jobId from the JSON response. Strip BOM if present.
+    try:
+        resp_data = r.json()
+    except Exception:
+        resp_data = json.loads(r.content.decode("utf-8-sig"))
+    job_id = None
+    if isinstance(resp_data, dict):
+        data_section = resp_data.get("data") or resp_data
+        job_id = data_section.get("jobId")
+    if not job_id:
+        # If no jobId was returned, fallback to synchronous export once.
+        # This handles small tables where synchronous export is allowed.
+        path_sync = f"/restapi/v2/workspaces/{workspace_id}/views/{view}/data"
+        sync_params = {"format": "json", "limit": limit, "offset": offset}
+        sync_url = f"{ANALYTICS_SERVER_URL}{path_sync}?{urlencode(sync_params)}"
+        r_sync = requests.get(sync_url, headers=_auth_headers(), timeout=120)
+        if r_sync.status_code == 401:
+            r_sync = requests.get(
+                sync_url,
+                headers=_auth_headers(get_access_token(True)),
+                timeout=120,
+            )
+        if r_sync.status_code != 200:
+            raise RuntimeError(f"GET {sync_url} -> {r_sync.status_code} {r_sync.text}")
+        try:
+            sync_data = r_sync.json()
+        except Exception:
+            sync_data = json.loads(r_sync.content.decode("utf-8-sig"))
+        # Slice the rows according to offset/limit if applicable
+        # Determine where the rows live: various APIs return rows under
+        # "rows" or "data" keys. We'll attempt to locate a list and slice it.
+        def slice_rows(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, list):
+                        obj[k] = v[offset : offset + limit]
+                    elif isinstance(v, dict):
+                        obj[k] = slice_rows(v)
+                return obj
+            return obj
+        return slice_rows(sync_data)
+
+    # Step 2: poll for job completion
+    status_path = f"/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}"
+    status_url = f"{ANALYTICS_SERVER_URL}{status_path}"
+    poll_interval = int(os.getenv("ZC_EXPORT_POLL_INTERVAL", "5"))
+    timeout_secs = int(os.getenv("ZC_EXPORT_TIMEOUT", "120"))
+    start_time = time.time()
+    while True:
+        r_status = requests.get(status_url, headers=_auth_headers(), timeout=60)
+        if r_status.status_code == 401:
+            r_status = requests.get(
+                status_url,
+                headers=_auth_headers(get_access_token(True)),
+                timeout=60,
+            )
+        if r_status.status_code != 200:
+            raise RuntimeError(
+                f"GET {status_url} -> {r_status.status_code} {r_status.text}"
+            )
+        try:
+            status_json = r_status.json()
+        except Exception:
+            status_json = json.loads(r_status.content.decode("utf-8-sig"))
+        status_data = status_json.get("data") or status_json
+        job_status = status_data.get("jobStatus") or status_data.get("status")
+        if job_status and job_status.upper() in {"COMPLETED", "SUCCESS", "FINISHED"}:
+            break
+        if time.time() - start_time > timeout_secs:
+            raise RuntimeError(
+                f"Export job {job_id} did not complete within {timeout_secs} seconds"
+            )
+        time.sleep(poll_interval)
+
+    # Step 3: download the result
+    data_path = f"/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}/data"
+    data_url = f"{ANALYTICS_SERVER_URL}{data_path}"
+    r_data = requests.get(data_url, headers=_auth_headers(), timeout=120)
+    if r_data.status_code == 401:
+        r_data = requests.get(
+            data_url,
             headers=_auth_headers(get_access_token(True)),
             timeout=120,
         )
-    if r.status_code != 200:
-        raise RuntimeError(f"GET {url} -> {r.status_code} {r.text}")
-    # Some Zoho Analytics endpoints return JSON with a UTF‑8 BOM. If the
-    # built‑in ``r.json()`` encounters a BOM it raises a JSONDecodeError.
+    if r_data.status_code != 200:
+        raise RuntimeError(f"GET {data_url} -> {r_data.status_code} {r_data.text}")
+    # Attempt to parse JSON and slice rows
     try:
-        return r.json()
+        export_data = r_data.json()
     except Exception:
-        import json as _json
-        # Decode bytes with utf‑8‑sig to strip the BOM, then parse
-        content = r.content.decode("utf-8-sig")
-        return _json.loads(content)
+        export_data = json.loads(r_data.content.decode("utf-8-sig"))
+    # Slice data according to offset/limit if keys are present
+    def slice_rows(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, list):
+                    obj[k] = v[offset : offset + limit]
+                elif isinstance(v, dict):
+                    obj[k] = slice_rows(v)
+            return obj
+        return obj
+    return slice_rows(export_data)
 
 
 def query_data(workspace_id: str, sql: str) -> Dict[str, Any]:

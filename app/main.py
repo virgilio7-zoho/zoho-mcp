@@ -1,40 +1,30 @@
-# app/main.py
-from fastapi import FastAPI, Body
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query
+from typing import Optional
+from .config import settings
+from .zoho_client_v2 import list_workspaces, list_views, get_access_token
 
-# Import “tolerante” a la estructura (si mueves archivos a raíz no rompe)
-try:
-    from app.zoho_client import v2_export_view, v2_sql_query, health_info
-except ModuleNotFoundError:
-    # fallback si el paquete es plano
-    from zoho_client import v2_export_view, v2_sql_query, health_info  # type: ignore
-
-app = FastAPI(title="Zoho MCP (v2)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Zoho Analytics MCP (v2-ready)")
 
 @app.get("/health")
 def health():
-    return health_info()
+    # Fuerza token para validar credenciales; si falla, FastAPI devuelve 500 con el error
+    get_access_token()
+    return {"status": "UP", "mode": "v2", "org": settings.ANALYTICS_ORG_ID}
 
-@app.post("/view_v2")
-def view_v2(body: dict = Body(...)):
-    view = body.get("view")
-    limit = int(body.get("limit", 100))
-    offset = int(body.get("offset", 0))
-    if not view:
-        return {"detail": "Falta 'view'."}
-    return v2_export_view(view, limit=limit, offset=offset)
+@app.get("/workspaces_v2")
+def workspaces_v2(limit: Optional[int] = Query(None, ge=1, le=100)):
+    try:
+        items = list_workspaces(limit or settings.WORKSPACE_RESULT_LIMIT)
+        return {"count": len(items), "items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/query_v2")
-def query_v2(body: dict = Body(...)):
-    sql = body.get("sql")
-    if not sql:
-        return {"detail": "Falta 'sql'."}
-    return v2_sql_query(sql)
+@app.get("/views_v2")
+def views_v2(workspace_id: str, limit: Optional[int] = Query(None, ge=1, le=200)):
+    try:
+        items = list_views(workspace_id, limit or settings.VIEW_RESULT_LIMIT)
+        # Si quieres solo TABLAS:
+        # items = [v for v in items if v.get("type","").upper() in ("TABLE","TABULAR VIEW")]
+        return {"count": len(items), "items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

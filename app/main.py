@@ -2,7 +2,8 @@
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.zoho_client_v2 import v2_export_view, v2_sql_query, health_info
+# ¡Importamos desde zoho_client.py (que SÍ existe)!
+from app.zoho_client import v2_export_view, v2_sql_query, health_info
 
 app = FastAPI(title="Zoho MCP (v2)")
 

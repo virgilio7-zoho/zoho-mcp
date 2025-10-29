@@ -1,76 +1,59 @@
-from __future__ import annotations
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Any, Optional
-from .config import settings
-from .zoho_client import export_sql, export_view_or_table, get_access_token
+
+from app.zoho_client import (
+    export_view_or_table,
+    export_sql,
+    health_status,
+)
 
 app = FastAPI(title="Zoho Analytics MCP", version="1.0.0")
 
-# CORS abierto para pruebas
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class QueryRequest(BaseModel):
-    sql: str = Field(..., description="Consulta SQL completa")
-    workspace: Optional[str] = Field(None, description="Workspace; default env")
-    # No imponemos limit aquí, lo haces en SQL si quieres.
-
-class ViewSmartRequest(BaseModel):
-    view: str = Field(..., description="Nombre de vista/tabla EXACTO en Zoho")
-    workspace: Optional[str] = None
-    limit: Optional[int] = Field(None, ge=1, le=20000)
-    offset: Optional[int] = Field(0, ge=0)
-
 @app.get("/health")
 def health():
-    return {"status": "UP", "workspace": settings.ZOHO_WORKSPACE}
+    return health_status()
 
-@app.get("/token-check")
-def token_check():
-    """
-    Intenta renovar un access token y lo oculta.
-    Útil para verificar configuración OAuth/entorno.
-    """
-    try:
-        token = get_access_token()
-        return {"ok": True, "token_len": len(token)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/query")
-def run_query(req: QueryRequest = Body(...)):
-    try:
-        data = export_sql(req.sql, workspace=req.workspace)
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# -------- Export por nombre de vista/tabla (C1/GET interno) --------
 @app.post("/view_smart")
-def view_smart(req: ViewSmartRequest = Body(...)):
-    try:
-        data = export_view_or_table(
-            view_or_table=req.view,
-            workspace=req.workspace,
-            limit=req.limit,
-            offset=req.offset,
-        )
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-def root():
-    return {
-        "name": "Zoho Analytics MCP",
-        "docs": "/docs",
-        "health": "/health",
-        "query": "/query (POST)",
-        "view": "/view_smart (POST)"
+def view_smart(payload: dict = Body(...)):
+    """
+    Body JSON:
+    {
+      "view": "VENDEDORES_DIFERENTES_COMPLETO",
+      "limit": 10,          # opcional
+      "offset": 0,          # opcional
+      "workspace": "MARKEM" # opcional (usa env por defecto)
     }
+    """
+    view = payload.get("view", "")
+    limit = payload.get("limit")
+    offset = int(payload.get("offset", 0))
+    workspace = payload.get("workspace")
+    data = export_view_or_table(view, workspace=workspace, limit=limit, offset=offset)
+    return data
+
+# -------- SQL (POST) --------
+@app.post("/query")
+def query(payload: dict = Body(...)):
+    """
+    Body JSON:
+    {
+      "sql": "SELECT * FROM \"VENDEDORES_DIFERENTES_COMPLETO\" LIMIT 10",
+      "limit": 100,         # opcional
+      "offset": 0,          # opcional
+      "workspace": "MARKEM" # opcional
+    }
+    """
+    sql = payload.get("sql", "")
+    limit = payload.get("limit")
+    offset = int(payload.get("offset", 0))
+    workspace = payload.get("workspace")
+    data = export_sql(sql, workspace=workspace, limit=limit, offset=offset)
+    return data

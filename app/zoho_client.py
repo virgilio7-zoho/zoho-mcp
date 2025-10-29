@@ -3,13 +3,14 @@
 Cliente Zoho Analytics API v2 (estable para Render).
 - Refresco automático de access_token con refresh_token
 - Endpoints v2: export view y SQL
-- Usa variables de entorno via pydantic-settings (config.py)
+- Usa variables de entorno via pydantic-settings (app.config)
 """
 
 import os
 import requests
 from urllib.parse import quote
 
+# Si tu config está en app/config.py (recomendado):
 from app.config import settings  # pydantic-settings
 
 # =========================================================
@@ -58,8 +59,7 @@ def _rest_v2_base() -> str:
 def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 100, offset: int = 0) -> dict:
     """
     Exporta datos de un view/table por API v2.
-    Endpoint esperado:
-      GET /restapi/v2/workspaces/{workspace_id}/views/{view}/data?limit=&offset=
+    GET /restapi/v2/workspaces/{workspace_id}/views/{view}/data?limit=&offset=
     """
     wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
     if not wsid:
@@ -69,10 +69,7 @@ def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 1
     view_enc = quote(view, safe="")
     url = f"{base}/workspaces/{wsid}/views/{view_enc}/data"
 
-    params = {
-        "limit": str(limit),
-        "offset": str(offset),
-    }
+    params = {"limit": str(limit), "offset": str(offset)}
     headers = {
         "Authorization": f"Zoho-oauthtoken {_get_access_token()}",
         "Accept": "application/json",
@@ -98,8 +95,7 @@ def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 1
 def v2_sql_query(sql: str, *, workspace_id: str | None = None) -> dict:
     """
     Ejecuta SQL por API v2 (si tu tenant lo tiene habilitado).
-    Endpoint esperado:
-      POST /restapi/v2/workspaces/{workspace_id}/sql
+    POST /restapi/v2/workspaces/{workspace_id}/sql
     Body: { "sql": "SELECT ..." }
     """
     wsid = workspace_id or settings.ZOHO_WORKSPACE_ID

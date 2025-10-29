@@ -1,5 +1,6 @@
 # app/config.py
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -8,8 +9,8 @@ class Settings(BaseSettings):
     ZOHO_ANALYTICS_API_BASE: str = Field(default="https://analyticsapi.zoho.com")
 
     # Identidad y workspace por defecto
-    ZOHO_OWNER_ORG: str = Field(..., description="Email u OrgID dueño del workspace, ej: 697009942 o vacevedo@...")  # obligatorio
-    ZOHO_WORKSPACE: str = Field(..., description='Nombre del workspace, ej: "MARKEM"')  # obligatorio
+    ZOHO_OWNER_ORG: str = Field(..., description="Email u OrgID dueño del workspace, ej: 697009942 o vacevedo@...")
+    ZOHO_WORKSPACE: str = Field(..., description='Nombre del workspace, ej: "MARKEM"')
 
     # OAuth
     ZOHO_ACCESS_TOKEN: str | None = None

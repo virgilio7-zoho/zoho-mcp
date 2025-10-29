@@ -1,108 +1,145 @@
-from __future__ import annotations
-import time
-from typing import Any, Dict, Tuple
+"""
+zoho_client.py — Cliente MCP para Zoho Analytics
+Versión estable para Render (incluye refresh token y soporte Export API clásico).
+"""
+
+import os
 import requests
 from urllib.parse import quote
-from .config import settings
 
-# Cache simple en memoria para el access_token
-_ACCESS_TOKEN: str | None = None
-_ACCESS_TOKEN_EXP: float | None = None  # epoch seconds
 
-def _now() -> float:
-    return time.time()
+# ================================================================
+# 🔐 Manejo de tokens
+# ================================================================
 
 def get_access_token() -> str:
     """
-    Obtiene (o renueva) el access token usando el refresh token.
-    Guarda en cache hasta ~55 minutos.
+    Devuelve el token de acceso activo.
+    Si expira, usa el refresh token para obtener uno nuevo.
     """
-    global _ACCESS_TOKEN, _ACCESS_TOKEN_EXP
-    if _ACCESS_TOKEN and _ACCESS_TOKEN_EXP and _now() < _ACCESS_TOKEN_EXP:
-        return _ACCESS_TOKEN
+    token = os.getenv("ZOHO_ACCESS_TOKEN")
+    refresh_token = os.getenv("ZOHO_REFRESH_TOKEN")
+    client_id = os.getenv("ZOHO_CLIENT_ID")
+    client_secret = os.getenv("ZOHO_CLIENT_SECRET")
 
-    token_url = f"{settings.ZOHO_ACCOUNTS_BASE}/oauth/v2/token"
+    if not token and all([refresh_token, client_id, client_secret]):
+        token = refresh_access_token(refresh_token, client_id, client_secret)
+
+    if not token:
+        raise RuntimeError("❌ Falta ZOHO_ACCESS_TOKEN o configuración de OAuth en variables de entorno.")
+
+    return token
+
+
+def refresh_access_token(refresh_token: str, client_id: str, client_secret: str) -> str:
+    """
+    Usa el refresh token de Zoho para generar un nuevo access token.
+    """
+    url = "https://accounts.zoho.com/oauth/v2/token"
     data = {
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
         "grant_type": "refresh_token",
-        "refresh_token": settings.ZOHO_REFRESH_TOKEN,
-        "client_id": settings.ZOHO_CLIENT_ID,
-        "client_secret": settings.ZOHO_CLIENT_SECRET,
     }
-    resp = requests.post(token_url, data=data, timeout=30)
+    r = requests.post(url, data=data, timeout=30)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"❌ Error al refrescar token Zoho: {r.status_code} {r.text}")
+
+    new_token = r.json().get("access_token")
+    if not new_token:
+        raise RuntimeError(f"❌ No se pudo obtener access_token del response: {r.text}")
+
+    os.environ["ZOHO_ACCESS_TOKEN"] = new_token
+    print("🔁 Nuevo token de acceso generado correctamente.")
+    return new_token
+
+
+# ================================================================
+# 🧠 Función principal — Export (C1)
+# ================================================================
+
+def smart_view_export(
+    owner_email: str,
+    workspace: str,
+    view: str,
+    access_token: str,
+    limit: int = 1000,
+    offset: int = 0
+) -> dict:
+    """
+    Exporta un view/table usando el Export API clásico (C1).
+    Incluye ZOHO_API_VERSION=1.0 obligatorio.
+    """
+
+    base = "https://analyticsapi.zoho.com/api"
+
+    # Aseguramos codificación correcta de caracteres
+    owner_enc = quote(owner_email, safe="")
+    workspace_enc = quote(workspace, safe="")
+    view_enc = quote(view, safe="")
+
+    url = f"{base}/{owner_enc}/{workspace_enc}/{view_enc}"
+
+    # Parámetros requeridos por el API
+    params = {
+        "ZOHO_ACTION": "EXPORT",
+        "ZOHO_OUTPUT_FORMAT": "JSON",
+        "ZOHO_API_VERSION": "1.0",
+        "ZOHO_ERROR_FORMAT": "JSON",
+        "ZOHO_ESCAPE": "true",
+        "ZOHO_STARTROW": str(offset),
+        "ZOHO_BULK_SIZE": str(limit),
+    }
+
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {access_token}",
+        "Accept": "application/json",
+    }
+
+    print(f"[SMART][C1] → Requesting: {url}")
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+
+    if resp.status_code == 401 and "invalid_token" in resp.text:
+        # Token expirado → refrescar automáticamente
+        print("🔑 Token expirado. Intentando refrescar...")
+        new_token = get_access_token()
+        headers["Authorization"] = f"Zoho-oauthtoken {new_token}"
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+
     if resp.status_code != 200:
         raise RuntimeError(
-            f"Error renovando access_token: {resp.status_code} {resp.text}"
+            f"❌ smart_view_export failed.\nURL: {resp.url}\nStatus: {resp.status_code}\nBody: {resp.text}"
         )
-    payload = resp.json()
-    access = payload.get("access_token")
-    if not access:
-        raise RuntimeError(f"Respuesta sin access_token: {payload}")
 
-    # Zoho típicamente expira en 3600s; usamos 3300 para margen
-    _ACCESS_TOKEN = access
-    _ACCESS_TOKEN_EXP = _now() + float(payload.get("expires_in", 3600)) - 300
-    return _ACCESS_TOKEN
+    try:
+        return resp.json()
+    except Exception:
+        raise RuntimeError(f"❌ No se pudo convertir respuesta JSON.\nBody: {resp.text[:500]}")
 
-def _auth_headers() -> Dict[str, str]:
-    return {"Authorization": f"Zoho-oauthtoken {get_access_token()}"}
 
-def _api(path: str) -> str:
-    return f"{settings.ZOHO_ANALYTICS_API_BASE}{path}"
+# ================================================================
+# 🧩 Función intermedia — usada por el endpoint /view_smart
+# ================================================================
 
-def export_sql(sql: str, workspace: str | None = None) -> Dict[str, Any]:
+def view_smart(owner: str, workspace: str, view: str, limit: int = 100, offset: int = 0):
     """
-    Exporta resultado de una consulta SQL en JSON.
-    Usa el endpoint 'simple' que ha mostrado mejor compatibilidad:
-    /api/{owner}/{workspace}/sql  (EXPORT -> JSON)
+    Función pública que usa smart_view_export.
+    Se conecta automáticamente con las variables de entorno.
     """
-    owner = settings.ZOHO_OWNER_ORG
-    ws = workspace or settings.ZOHO_WORKSPACE
-    # Cuidado con caracteres: owner puede ser numérico u org key; no escapamos el slash.
-    path = f"/api/{quote(owner, safe='')}/{quote(ws, safe='')}/sql"
-    url = _api(path)
+    token = get_access_token()
+    result = smart_view_export(owner, workspace, view, token, limit, offset)
+    return result
 
-    # Parámetros estilo Zoho Analytics EXPORT
-    form = {
-        "ZOHO_ACTION": "EXPORT",
-        "ZOHO_OUTPUT_FORMAT": "JSON",
-        "ZOHO_ERROR_FORMAT": "JSON",
-        "SQLQUERY": sql,
-    }
-    r = requests.post(url, headers=_auth_headers(), data=form, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"SQL export error {r.status_code}: {r.text}")
-    return r.json()
 
-def export_view_or_table(
-    view_or_table: str,
-    workspace: str | None = None,
-    limit: int | None = None,
-    offset: int | None = None,
-) -> Dict[str, Any]:
+# ================================================================
+# 🩺 Healthcheck para /health
+# ================================================================
+
+def health_status():
     """
-    Exporta una vista/tabla en JSON usando el 'simple path' que te funcionó:
-    /api/{owner}/{workspace}/{view_or_table}?EXPORT JSON
-
-    Se agregan LIMIT y OFFSET para paginar y evitar OOM.
+    Verifica que el servidor MCP esté vivo y configurado correctamente.
     """
-    owner = settings.ZOHO_OWNER_ORG
-    ws = workspace or settings.ZOHO_WORKSPACE
-    lim = limit or settings.DEFAULT_LIMIT
-    off = offset or 0
-
-    path = f"/api/{quote(owner, safe='')}/{quote(ws, safe='')}/{quote(view_or_table, safe='')}"
-    url = _api(path)
-
-    form = {
-        "ZOHO_ACTION": "EXPORT",
-        "ZOHO_OUTPUT_FORMAT": "JSON",
-        "ZOHO_ERROR_FORMAT": "JSON",
-        "LIMIT": str(lim),
-        "OFFSET": str(off),
-    }
-    r = requests.post(url, headers=_auth_headers(), data=form, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(
-            f"Export view error {r.status_code} url={url} body={r.text}"
-        )
-    return r.json()
+    workspace = os.getenv("ZOHO_WORKSPACE", "UNKNOWN")
+    return {"status": "UP", "workspace": workspace}

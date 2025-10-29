@@ -57,10 +57,6 @@ def _rest_v2_base() -> str:
 # =========================================================
 
 def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 100, offset: int = 0) -> dict:
-    """
-    Exporta datos de un view/table por API v2.
-    GET /restapi/v2/workspaces/{workspace_id}/views/{view}/data?limit=&offset=
-    """
     wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
     if not wsid:
         raise ValueError("Falta ZOHO_WORKSPACE_ID")
@@ -76,16 +72,56 @@ def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 1
     }
 
     print(f"[V2][GET] {url}")
+    print(f"[V2][PARAMS] {params}")
+
     r = requests.get(url, headers=headers, params=params, timeout=60)
+    print(f"[V2][RESP] {r.status_code} {r.text[:500]}")
 
     if r.status_code == 401:
+        print("[V2] Token expirado, intentando refrescar...")
         headers["Authorization"] = f"Zoho-oauthtoken {_get_access_token(force=True)}"
         r = requests.get(url, headers=headers, params=params, timeout=60)
+        print(f"[V2][RETRY] {r.status_code} {r.text[:500]}")
 
     if r.status_code != 200:
         raise RuntimeError(f"v2_export_view failed.\nURL: {r.url}\nstatus: {r.status_code}\nbody:\n{r.text}")
 
     return r.json()
+
+
+def v2_sql_query(sql: str, *, workspace_id: str | None = None) -> dict:
+    wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
+    if not wsid:
+        raise ValueError("Falta ZOHO_WORKSPACE_ID")
+    if not sql or not sql.strip():
+        raise ValueError("sql vacío")
+
+    base = _rest_v2_base()
+    url = f"{base}/workspaces/{wsid}/sql"
+    data = {"sql": sql}
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {_get_access_token()}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    print(f"[V2][POST] {url}")
+    print(f"[V2][BODY] {data}")
+
+    r = requests.post(url, headers=headers, json=data, timeout=60)
+    print(f"[V2][RESP] {r.status_code} {r.text[:500]}")
+
+    if r.status_code == 401:
+        print("[V2] Token expirado, intentando refrescar...")
+        headers["Authorization"] = f"Zoho-oauthtoken {_get_access_token(force=True)}"
+        r = requests.post(url, headers=headers, json=data, timeout=60)
+        print(f"[V2][RETRY] {r.status_code} {r.text[:500]}")
+
+    if r.status_code != 200:
+        raise RuntimeError(f"v2_sql_query failed.\nURL: {url}\nstatus: {r.status_code}\nbody:\n{r.text}")
+
+    return r.json()
+
 
 
 # =========================================================

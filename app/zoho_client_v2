@@ -1,157 +1,130 @@
+# app/zoho_client_v2.py
 """
-zoho_client_v2.py — Cliente Zoho Analytics API v2 (Render-ready)
-- Export Data v2:  /api/v2/workspaces/{workspaceId}/views/{viewName}/data  (POST)
-- SQL v2:          /api/v2/workspaces/{workspaceId}/sql                     (POST)
+Cliente Zoho Analytics API v2 (mínimo funcional).
+- Incluye refresco de token con refresh_token
+- Expone v2_export_view y v2_sql_query
+- Usa variables de entorno vía config.py
 """
 
 import os
-from typing import Optional
+import requests
 from urllib.parse import quote
 
-import requests
+from app.config import settings  # pydantic-settings
 
-from .config import settings
-
-
-# ================================================================
-# Tokens (reutiliza OAuth con refresh token)
-# ================================================================
-
-def get_access_token_v2(force_refresh: bool = False) -> str:
-    """Devuelve access token; refresca si se pide o falta."""
-    if force_refresh:
-        return _refresh_access_token()
-
-    token = os.getenv("ZOHO_ACCESS_TOKEN")
-    if token:
-        return token
-    return _refresh_access_token()
-
+# ---------------------------
+# Tokens
+# ---------------------------
 
 def _refresh_access_token() -> str:
-    refresh_token = os.getenv("ZOHO_REFRESH_TOKEN")
-    client_id = os.getenv("ZOHO_CLIENT_ID")
-    client_secret = os.getenv("ZOHO_CLIENT_SECRET")
-
-    if not (refresh_token and client_id and client_secret):
-        raise RuntimeError("Faltan creds OAuth (REFRESH/CLIENT_ID/CLIENT_SECRET).")
-
-    url = settings.ZOHO_ACCOUNTS_BASE.rstrip("/") + "/oauth/v2/token"
+    url = f"{settings.ZOHO_ACCOUNTS_BASE.rstrip('/')}/oauth/v2/token"
     data = {
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "refresh_token": settings.ZOHO_REFRESH_TOKEN,
+        "client_id": settings.ZOHO_CLIENT_ID,
+        "client_secret": settings.ZOHO_CLIENT_SECRET,
         "grant_type": "refresh_token",
     }
     r = requests.post(url, data=data, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Refresh token FAILED {r.status_code}: {r.text}")
-    new_token = r.json().get("access_token")
-    if not new_token:
-        raise RuntimeError(f"Refresh token sin access_token: {r.text}")
-    os.environ["ZOHO_ACCESS_TOKEN"] = new_token
-    print("🔁 Nuevo access token (v2).")
-    return new_token
+        raise RuntimeError(f"Error refresh token: {r.status_code} {r.text}")
+    token = r.json().get("access_token")
+    if not token:
+        raise RuntimeError(f"No access_token in response: {r.text}")
+    os.environ["ZOHO_ACCESS_TOKEN"] = token
+    print("🔄 Nuevo access token obtenido.")
+    return token
 
 
-# ================================================================
-# Helpers
-# ================================================================
-
-def _api_v2_base() -> str:
-    return settings.ZOHO_ANALYTICS_API_BASE.rstrip("/") + "/api/v2"
-
-
-def _workspace_id(ws_id: Optional[str] = None) -> str:
-    val = ws_id or settings.ZOHO_WORKSPACE_ID
-    if not val or not str(val).strip():
-        raise ValueError("Falta ZOHO_WORKSPACE_ID (numérico) en variables.")
-    return str(val).strip()
+def _get_access_token(force: bool = False) -> str:
+    tok = os.getenv("ZOHO_ACCESS_TOKEN")
+    if force or not tok:
+        return _refresh_access_token()
+    return tok
 
 
-# ================================================================
-# Export Data v2
-# ================================================================
+# ---------------------------
+# API v2 helpers
+# ---------------------------
 
-def v2_export_view(view: str,
-                   limit: Optional[int] = None,
-                   offset: int = 0,
-                   workspace_id: Optional[str] = None) -> dict:
+def _rest_v2_base() -> str:
+    # https://analyticsapi.zoho.com/restapi/v2/...
+    return settings.ZOHO_ANALYTICS_API_BASE.rstrip("/") + "/restapi/v2"
+
+
+def v2_export_view(view: str, *, workspace_id: str | None = None, limit: int = 100, offset: int = 0) -> dict:
     """
-    Exporta filas de una vista/tabla por API v2.
-    POST /api/v2/workspaces/{workspaceId}/views/{view}/data
-    Body: { "limit": N, "offset": M }
+    Llama a la API v2 para exportar datos de un view/table.
+    Endpoint sugerido: /workspaces/{workspace_id}/views/{view}/data
+    Si falla por 401, refresca token y reintenta una vez.
     """
-    ws_id = _workspace_id(workspace_id)
-    base = _api_v2_base()
+    wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
+    if not wsid:
+        raise ValueError("Falta ZOHO_WORKSPACE_ID")
+
+    base = _rest_v2_base()
     view_enc = quote(view, safe="")
-    url = f"{base}/workspaces/{ws_id}/views/{view_enc}/data"
+    url = f"{base}/workspaces/{wsid}/views/{view_enc}/data"
 
-    body = {
-        "limit": int(limit if (limit and limit > 0) else settings.DEFAULT_LIMIT),
-        "offset": int(offset if offset >= 0 else 0),
+    params = {
+        "limit": str(limit),
+        "offset": str(offset),
     }
-
     headers = {
-        "Authorization": f"Zoho-oauthtoken {get_access_token_v2()}",
+        "Authorization": f"Zoho-oauthtoken {_get_access_token()}",
         "Accept": "application/json",
-        "Content-Type": "application/json",
     }
 
-    print(f"[V2][VIEW] POST {url} body={body}")
-    resp = requests.post(url, headers=headers, json=body, timeout=90)
+    print(f"[V2][GET] {url}")
+    r = requests.get(url, headers=headers, params=params, timeout=60)
 
-    # token expirado
-    if resp.status_code == 401 and "invalid_token" in resp.text:
-        headers["Authorization"] = f"Zoho-oauthtoken {get_access_token_v2(force_refresh=True)}"
-        resp = requests.post(url, headers=headers, json=body, timeout=90)
+    if r.status_code == 401:
+        headers["Authorization"] = f"Zoho-oauthtoken {_get_access_token(force=True)}"
+        r = requests.get(url, headers=headers, params=params, timeout=60)
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"v2_export_view failed.\nURL: {url}\nstatus: {resp.status_code}\nbody:\n{resp.text}")
+    if r.status_code != 200:
+        raise RuntimeError(f"v2_export_view failed.\nURL: {r.url}\nstatus: {r.status_code}\nbody:\n{r.text}")
 
-    try:
-        return resp.json()
-    except Exception:
-        raise RuntimeError(f"Respuesta no JSON en v2_export_view:\n{resp.text[:600]}")
+    return r.json()
 
 
-# ================================================================
-# SQL v2
-# ================================================================
-
-def v2_sql_query(sql: str, workspace_id: Optional[str] = None) -> dict:
+def v2_sql_query(sql: str, *, workspace_id: str | None = None) -> dict:
     """
-    Ejecuta SQL por API v2.
-    POST /api/v2/workspaces/{workspaceId}/sql
-    Body: { "sql": "<consulta>" }
+    Ejecuta SQL usando API v2 (cuando el endpoint esté habilitado).
+    Endpoint sugerido: /workspaces/{workspace_id}/sql
+    Si tu tenant no lo tiene abierto, puede devolver 404/400.
     """
+    wsid = workspace_id or settings.ZOHO_WORKSPACE_ID
+    if not wsid:
+        raise ValueError("Falta ZOHO_WORKSPACE_ID")
     if not sql or not sql.strip():
-        raise ValueError("sql vacío.")
+        raise ValueError("sql vacío")
 
-    ws_id = _workspace_id(workspace_id)
-    base = _api_v2_base()
-    url = f"{base}/workspaces/{ws_id}/sql"
-
-    body = {"sql": sql}
+    base = _rest_v2_base()
+    url = f"{base}/workspaces/{wsid}/sql"
+    data = {"sql": sql}
 
     headers = {
-        "Authorization": f"Zoho-oauthtoken {get_access_token_v2()}",
+        "Authorization": f"Zoho-oauthtoken {_get_access_token()}",
         "Accept": "application/json",
-        "Content-Type": "application/json",
     }
 
-    print(f"[V2][SQL] POST {url}")
-    resp = requests.post(url, headers=headers, json=body, timeout=120)
+    print(f"[V2][POST] {url}")
+    r = requests.post(url, headers=headers, json=data, timeout=60)
 
-    # token expirado
-    if resp.status_code == 401 and "invalid_token" in resp.text:
-        headers["Authorization"] = f"Zoho-oauthtoken {get_access_token_v2(force_refresh=True)}"
-        resp = requests.post(url, headers=headers, json=body, timeout=120)
+    if r.status_code == 401:
+        headers["Authorization"] = f"Zoho-oauthtoken {_get_access_token(force=True)}"
+        r = requests.post(url, headers=headers, json=data, timeout=60)
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"v2_sql_query failed.\nURL: {url}\nstatus: {resp.status_code}\nbody:\n{resp.text}")
+    if r.status_code != 200:
+        raise RuntimeError(f"v2_sql_query failed.\nURL: {url}\nstatus: {r.status_code}\nbody:\n{r.text}")
 
-    try:
-        return resp.json()
-    except Exception:
-        raise RuntimeError(f"Respuesta no JSON en v2_sql_query:\n{resp.text[:600]}")
+    return r.json()
+
+
+def health_info() -> dict:
+    return {
+        "status": "UP",
+        "mode": "v2",
+        "workspace": settings.ZOHO_WORKSPACE,
+        "workspace_id": settings.ZOHO_WORKSPACE_ID,
+    }

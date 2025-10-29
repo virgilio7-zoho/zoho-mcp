@@ -22,10 +22,9 @@ See ``config.py`` for the list of variables and their descriptions.
 
 from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-# Import the client helpers from the sibling module. Relative import avoids
-# requiring ``app`` to be installed as a top-level package.
 from .zoho_client import (
     health_info,
     get_workspaces_list,
@@ -35,10 +34,13 @@ from .zoho_client import (
     query_data,
 )
 
+# ---------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------
 
 app = FastAPI(title="Zoho Analytics MCP (v2) — Tools oficiales")
 
-# Allow CORS from all origins. In production you may wish to restrict this.
+# Allow CORS from all origins (useful for local and MCP clients)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,33 +49,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------
+# Optional alias for MCP clients that expect `/sse`
+# ---------------------------------------------------------------------
 
-# ---------- Health ----------
+@app.get("/sse")
+def sse_redirect():
+    """Redirects `/sse` → `/openapi.json` for MCP clients."""
+    return RedirectResponse(url="/openapi.json")
+
+
+# ---------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------
+
 @app.get("/health")
 def health() -> dict:
-    """Simple health endpoint returning runtime metadata.
-
-    Returns a small JSON object containing the server status,
-    organisation ID, configured server URL, data directory and
-    whether an access token is currently cached.
-    """
+    """Simple health endpoint returning runtime metadata."""
     return health_info()
 
 
-# ---------- get_workspaces_list ----------
+# ---------------------------------------------------------------------
+# get_workspaces_list
+# ---------------------------------------------------------------------
+
 @app.get("/workspaces_v2")
 def workspaces_v2() -> dict:
-    """List all workspaces available to the authenticated user.
-
-    Returns
-    -------
-    dict
-        A JSON object representing the list of workspaces.
-    """
+    """List all workspaces available to the authenticated user."""
     return get_workspaces_list()
 
 
-# ---------- search_views ----------
+# ---------------------------------------------------------------------
+# search_views
+# ---------------------------------------------------------------------
+
 @app.get("/views_v2")
 def views_v2(
     workspace_id: str = Query(..., description="Workspace ID"),
@@ -81,66 +90,29 @@ def views_v2(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
 ) -> dict:
-    """Search or list views within a workspace.
-
-    Parameters
-    ----------
-    workspace_id: str
-        Identifier of the workspace whose views should be retrieved.
-    q: str | None
-        Optional search keyword. If provided, the API will attempt to match
-        views by this keyword. If omitted, all views are returned (up to
-        the specified limit).
-    limit: int
-        Maximum number of results to return (bounded by server-side
-        restrictions). Defaults to 200.
-    offset: int
-        Index of the first result to return (for pagination). Defaults to 0.
-
-    Returns
-    -------
-    dict
-        A JSON object with the matching views.
-    """
+    """Search or list views within a workspace."""
     return search_views(workspace_id, q, limit, offset)
 
 
-# ---------- get_view_details ----------
+# ---------------------------------------------------------------------
+# get_view_details
+# ---------------------------------------------------------------------
+
 @app.get("/view_details_v2")
 def view_details_v2(
     workspace_id: str = Query(
-        ...,
-        description=(
-            "Workspace ID (retained for compatibility; ignored by the underlying API)."
-        ),
+        ..., description="Workspace ID (kept for compatibility; ignored)."
     ),
     view_id: str = Query(..., description="View ID o nombre exacto"),
 ) -> dict:
-    """Retrieve details for a specific view.
-
-    While the Zoho Analytics API endpoint used to fetch view details
-    (``/restapi/v2/views/<view-id>``) does not need the workspace ID, this
-    parameter is still accepted by this endpoint for backward compatibility
-    with older clients. The workspace ID is ignored in the underlying API
-    call but may be validated for emptiness. This design mirrors the
-    behaviour described in the official documentation【357598884937503†L126-L134】.
-
-    Parameters
-    ----------
-    workspace_id: str
-        Identifier of the workspace (not used by this API call).
-    view_id: str
-        Identifier or exact name of the view.
-
-    Returns
-    -------
-    dict
-        JSON response containing metadata of the specified view.
-    """
+    """Retrieve metadata for a specific view."""
     return get_view_details(workspace_id, view_id)
 
 
-# ---------- export_view ----------
+# ---------------------------------------------------------------------
+# export_view
+# ---------------------------------------------------------------------
+
 class ExportViewBody(BaseModel):
     workspace_id: str = Field(..., description="Workspace ID")
     view: str = Field(..., description="ID o nombre de la vista/tabla")
@@ -150,21 +122,14 @@ class ExportViewBody(BaseModel):
 
 @app.post("/export_view_v2")
 def export_view_v2(payload: ExportViewBody = Body(...)) -> dict:
-    """Export data from a specific view.
-
-    This endpoint accepts a workspace ID, a view identifier and pagination
-    parameters (``limit`` and ``offset``). It delegates to the
-    ``export_view`` helper in ``zoho_client.py``, which uses the Zoho
-    Analytics Bulk API to asynchronously export the view's data in JSON
-    format【215211381353514†L1082-L1101】. The helper transparently falls back
-    to the synchronous export API when the bulk API is unavailable and
-    performs client‑side slicing according to the requested limit and
-    offset. See the helper's docstring for full details.
-    """
+    """Export data from a specific view."""
     return export_view(payload.workspace_id, payload.view, payload.limit, payload.offset)
 
 
-# ---------- query_data ----------
+# ---------------------------------------------------------------------
+# query_data
+# ---------------------------------------------------------------------
+
 class QueryBody(BaseModel):
     workspace_id: str = Field(..., description="Workspace ID")
     sql: str = Field(..., description="Consulta SQL")
@@ -172,11 +137,5 @@ class QueryBody(BaseModel):
 
 @app.post("/query_v2")
 def query_v2(payload: QueryBody = Body(...)) -> dict:
-    """Execute a SQL query against a workspace.
-
-    For complex analytical queries the Zoho Analytics API provides a SQL
-    endpoint which accepts arbitrary SQL queries (subject to security
-    restrictions). This endpoint simply forwards the provided SQL to the
-    underlying API and returns the resulting data set.
-    """
+    """Execute a SQL query against a workspace."""
     return query_data(payload.workspace_id, payload.sql)

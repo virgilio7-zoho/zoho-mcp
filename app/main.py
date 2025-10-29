@@ -152,11 +152,14 @@ class ExportViewBody(BaseModel):
 def export_view_v2(payload: ExportViewBody = Body(...)) -> dict:
     """Export data from a specific view.
 
-    This endpoint proxies the call to the `export_view` helper which
-    ultimately hits the Zoho Analytics endpoint
-    ``/restapi/v2/workspaces/{workspace_id}/views/{view}/data`` with
-    query parameters controlling the format and pagination. See the
-    implementation in ``zoho_client.py`` for details.
+    This endpoint accepts a workspace ID, a view identifier and pagination
+    parameters (``limit`` and ``offset``). It delegates to the
+    ``export_view`` helper in ``zoho_client.py``, which uses the Zoho
+    Analytics Bulk API to asynchronously export the view's data in JSON
+    format【215211381353514†L1082-L1101】. The helper transparently falls back
+    to the synchronous export API when the bulk API is unavailable and
+    performs client‑side slicing according to the requested limit and
+    offset. See the helper's docstring for full details.
     """
     return export_view(payload.workspace_id, payload.view, payload.limit, payload.offset)
 

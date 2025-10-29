@@ -1,10 +1,12 @@
-from fastapi import FastAPI, Body
+# app/main.py
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-from app.zoho_client import (
+from .zoho_client import (
+    health_status,
     export_view_or_table,
     export_sql,
-    health_status,
 )
 
 app = FastAPI(title="Zoho Analytics MCP", version="1.0.0")
@@ -16,44 +18,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class ViewSmartRequest(BaseModel):
+    view: str = Field(..., description='Nombre exacto de la vista/tabla')
+    limit: int | None = Field(default=10)
+    offset: int = Field(default=0)
+
+
+class QueryRequest(BaseModel):
+    sql: str = Field(..., description='Consulta SQL, ej: SELECT * FROM "Tabla" LIMIT 10')
+
+
 @app.get("/health")
 def health():
     return health_status()
 
-# -------- Export por nombre de vista/tabla (C1/GET interno) --------
-@app.post("/view_smart")
-def view_smart(payload: dict = Body(...)):
-    """
-    Body JSON:
-    {
-      "view": "VENDEDORES_DIFERENTES_COMPLETO",
-      "limit": 10,          # opcional
-      "offset": 0,          # opcional
-      "workspace": "MARKEM" # opcional (usa env por defecto)
-    }
-    """
-    view = payload.get("view", "")
-    limit = payload.get("limit")
-    offset = int(payload.get("offset", 0))
-    workspace = payload.get("workspace")
-    data = export_view_or_table(view, workspace=workspace, limit=limit, offset=offset)
-    return data
 
-# -------- SQL (POST) --------
+@app.post("/view_smart")
+def view_smart(req: ViewSmartRequest):
+    try:
+        data = export_view_or_table(req.view, limit=req.limit, offset=req.offset)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/query")
-def query(payload: dict = Body(...)):
-    """
-    Body JSON:
-    {
-      "sql": "SELECT * FROM \"VENDEDORES_DIFERENTES_COMPLETO\" LIMIT 10",
-      "limit": 100,         # opcional
-      "offset": 0,          # opcional
-      "workspace": "MARKEM" # opcional
-    }
-    """
-    sql = payload.get("sql", "")
-    limit = payload.get("limit")
-    offset = int(payload.get("offset", 0))
-    workspace = payload.get("workspace")
-    data = export_sql(sql, workspace=workspace, limit=limit, offset=offset)
-    return data
+def query(req: QueryRequest):
+    try:
+        data = export_sql(req.sql)
+        return data
+    except Exception as e:
+        # tip común: si mandas texto plano en lugar de JSON, FastAPI te dará 422.
+        raise HTTPException(status_code=500, detail=str(e))

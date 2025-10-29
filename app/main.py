@@ -198,7 +198,7 @@ ACTIONS: list[dict] = [
     {
         "name": "workspaces_v2",
         "description": "List the workspaces available to the authenticated user.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {},
             "additionalProperties": False,
@@ -207,7 +207,7 @@ ACTIONS: list[dict] = [
     {
         "name": "views_v2",
         "description": "Search or list views within a workspace.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "workspace_id": {"type": "string"},
@@ -222,7 +222,7 @@ ACTIONS: list[dict] = [
     {
         "name": "view_details_v2",
         "description": "Retrieve metadata for a specific view.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "workspace_id": {"type": "string"},
@@ -235,7 +235,7 @@ ACTIONS: list[dict] = [
     {
         "name": "export_view_v2",
         "description": "Export data from a specific view.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "workspace_id": {"type": "string"},
@@ -250,7 +250,7 @@ ACTIONS: list[dict] = [
     {
         "name": "query_v2",
         "description": "Execute a SQL query against a workspace.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "workspace_id": {"type": "string"},
@@ -318,76 +318,223 @@ async def sse_actions(request: Request) -> StreamingResponse:
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-class McpInvoke(BaseModel):
-    """Model for an MCP invocation request.
+#
+# JSON-RPC structures for MCP discovery and invocation
+#
 
-    The MCP client sends a JSON object containing the name of the action to
-    execute and an ``input`` object with the parameters for that action. This
-    model validates the structure before the request is routed to the
-    appropriate helper function.
-    """
+# Define the tool metadata for JSON-RPC tools/list responses. Each tool object
+# includes a name, human‑readable title, description and JSON Schema for the
+# input parameters. This mirrors the structure outlined in the MCP
+# documentation for tool discovery【136852395087279†L414-L431】.
+TOOL_DEFINITIONS: list[dict] = [
+    {
+        "name": "workspaces_v2",
+        "title": "List Workspaces",
+        "description": "List all workspaces available to the authenticated user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "views_v2",
+        "title": "Search Views",
+        "description": "Search or list views within a workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "q": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": ["workspace_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "view_details_v2",
+        "title": "View Details",
+        "description": "Retrieve metadata for a specific view.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "view_id": {"type": "string"},
+            },
+            "required": ["workspace_id", "view_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "export_view_v2",
+        "title": "Export View",
+        "description": "Export data from a specific view.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "view": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": ["workspace_id", "view"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "query_v2",
+        "title": "Execute SQL",
+        "description": "Execute a SQL query against a workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "sql": {"type": "string"},
+            },
+            "required": ["workspace_id", "sql"],
+            "additionalProperties": False,
+        },
+    },
+]
 
-    action: str = Field(..., description="Name of the MCP action to invoke")
-    input: dict = Field(default_factory=dict, description="Parameters for the action")
 
-
+# Handle both the simple MCP invocation format (``{action, input}``) and
+# JSON‑RPC requests as used by the MCP specification. Clients like ChatGPT
+# send JSON‑RPC requests to discover and invoke tools. This handler
+# inspects the incoming payload to determine which protocol is being used
+# and returns the appropriate response format.
 @app.post("/mcp")
-def mcp_invoke(payload: McpInvoke):
-    """Invoke one of the defined MCP actions.
-
-    This endpoint receives a JSON payload with an ``action`` field indicating
-    which tool should run and an ``input`` field containing the arguments.
-    Supported actions are: ``workspaces_v2``, ``views_v2``, ``view_details_v2``,
-    ``export_view_v2`` and ``query_v2``. The helper functions defined at the
-    top of this module are used to perform the actual API calls.
-
-    Returns
-    -------
-    dict
-        A JSON object containing either the result of the action or an error
-        description if the action name is not recognised.
-    """
-    name = payload.action
-    params = payload.input or {}
-
+async def mcp_invoke(request: Request):
     try:
-        if name == "workspaces_v2":
-            result = get_workspaces_list()
-        elif name == "views_v2":
-            workspace_id = params.get("workspace_id")
-            if not workspace_id:
-                raise ValueError("'workspace_id' es requerido para views_v2")
-            result = search_views(
-                workspace_id,
-                params.get("q"),
-                int(params.get("limit", 200)),
-                int(params.get("offset", 0)),
-            )
-        elif name == "view_details_v2":
-            workspace_id = params.get("workspace_id")
-            view_id = params.get("view_id")
-            if not (workspace_id and view_id):
-                raise ValueError("'workspace_id' y 'view_id' son requeridos para view_details_v2")
-            result = get_view_details(workspace_id, view_id)
-        elif name == "export_view_v2":
-            workspace_id = params.get("workspace_id")
-            view = params.get("view")
-            if not (workspace_id and view):
-                raise ValueError("'workspace_id' y 'view' son requeridos para export_view_v2")
-            limit = int(params.get("limit", 100))
-            offset = int(params.get("offset", 0))
-            result = export_view(workspace_id, view, limit, offset)
-        elif name == "query_v2":
-            workspace_id = params.get("workspace_id")
-            sql = params.get("sql")
-            if not (workspace_id and sql):
-                raise ValueError("'workspace_id' y 'sql' son requeridos para query_v2")
-            result = query_data(workspace_id, sql)
-        else:
-            return JSONResponse(status_code=404, content={"ok": False, "error": f"Acción desconocida: {name}"})
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
 
-        return {"ok": True, "action": name, "result": result}
-    except Exception as e:
-        # For debugging purposes, return the error message. In production, you
-        # may wish to log the exception and return a generic error message.
-        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+    # --- JSON‑RPC 2.0 handling ---
+    if isinstance(data, dict) and data.get("jsonrpc") == "2.0":
+        jsonrpc_id = data.get("id")
+        method = data.get("method")
+        params = data.get("params", {}) or {}
+
+        # Tool discovery
+        if method == "tools/list":
+            result = {"tools": TOOL_DEFINITIONS}
+            return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": result}
+
+        # Tool execution
+        if method == "tools/call":
+            name = params.get("name")
+            arguments = params.get("arguments", {}) or {}
+            try:
+                # Dispatch to the corresponding helper based on the tool name
+                if name == "workspaces_v2":
+                    result_data = get_workspaces_list()
+                elif name == "views_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    if not workspace_id:
+                        raise ValueError("Missing required parameter: workspace_id")
+                    result_data = search_views(
+                        workspace_id,
+                        arguments.get("q"),
+                        int(arguments.get("limit", 200)),
+                        int(arguments.get("offset", 0)),
+                    )
+                elif name == "view_details_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    view_id = arguments.get("view_id")
+                    if not (workspace_id and view_id):
+                        raise ValueError("Missing required parameters: workspace_id and view_id")
+                    result_data = get_view_details(workspace_id, view_id)
+                elif name == "export_view_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    view = arguments.get("view")
+                    if not (workspace_id and view):
+                        raise ValueError("Missing required parameters: workspace_id and view")
+                    limit = int(arguments.get("limit", 100))
+                    offset = int(arguments.get("offset", 0))
+                    result_data = export_view(workspace_id, view, limit, offset)
+                elif name == "query_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    sql = arguments.get("sql")
+                    if not (workspace_id and sql):
+                        raise ValueError("Missing required parameters: workspace_id and sql")
+                    result_data = query_data(workspace_id, sql)
+                else:
+                    return JSONResponse(status_code=404, content={"jsonrpc": "2.0", "id": jsonrpc_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}})
+
+                # Return the result as content array per MCP spec
+                return {
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "json",
+                                "value": result_data,
+                            }
+                        ]
+                    },
+                }
+            except Exception as exc:
+                return JSONResponse(status_code=400, content={
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "error": {"code": -32000, "message": str(exc)}
+                })
+
+        # Unknown method
+        return JSONResponse(status_code=404, content={
+            "jsonrpc": "2.0",
+            "id": jsonrpc_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        })
+
+    # --- Simple (legacy) invocation format ---
+    # Accept the previous `{action: name, input: {…}}` schema for backward compatibility.
+    if isinstance(data, dict) and "action" in data:
+        name = data.get("action")
+        arguments = data.get("input", {}) or {}
+        try:
+            if name == "workspaces_v2":
+                result_data = get_workspaces_list()
+            elif name == "views_v2":
+                workspace_id = arguments.get("workspace_id")
+                if not workspace_id:
+                    raise ValueError("Missing required parameter: workspace_id")
+                result_data = search_views(
+                    workspace_id,
+                    arguments.get("q"),
+                    int(arguments.get("limit", 200)),
+                    int(arguments.get("offset", 0)),
+                )
+            elif name == "view_details_v2":
+                workspace_id = arguments.get("workspace_id")
+                view_id = arguments.get("view_id")
+                if not (workspace_id and view_id):
+                    raise ValueError("Missing required parameters: workspace_id and view_id")
+                result_data = get_view_details(workspace_id, view_id)
+            elif name == "export_view_v2":
+                workspace_id = arguments.get("workspace_id")
+                view = arguments.get("view")
+                if not (workspace_id and view):
+                    raise ValueError("Missing required parameters: workspace_id and view")
+                limit = int(arguments.get("limit", 100))
+                offset = int(arguments.get("offset", 0))
+                result_data = export_view(workspace_id, view, limit, offset)
+            elif name == "query_v2":
+                workspace_id = arguments.get("workspace_id")
+                sql = arguments.get("sql")
+                if not (workspace_id and sql):
+                    raise ValueError("Missing required parameters: workspace_id and sql")
+                result_data = query_data(workspace_id, sql)
+            else:
+                return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown action: {name}"})
+
+            return {"ok": True, "action": name, "result": result_data}
+        except Exception as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+
+    # If the payload does not match any known format, return an error.
+    return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request"}})

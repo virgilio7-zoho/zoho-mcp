@@ -167,34 +167,49 @@ def search_views(
 ) -> Dict[str, Any]:
     """Fetch views in a workspace filtered by an optional keyword.
 
+    This implementation uses the ``CONFIG`` parameter described in the
+    official **Get Views** API documentation to filter and paginate the
+    results. According to the docs, a JSON object must be passed under
+    the ``CONFIG`` query parameter with fields such as ``keyword``,
+    ``noOfResult`` and ``startIndex``【985669613019000†L53-L86】. Passing a
+    simple ``search`` parameter (as in earlier versions of this client)
+    will return unfiltered results; therefore we construct the CONFIG
+    JSON when a keyword is provided. If no keyword is specified, the
+    CONFIG will still include pagination parameters.
+
     Parameters
     ----------
     workspace_id : str
         Identifier of the workspace. Must not be empty.
     q : str | None
-        Optional search keyword. According to the metadata API, the parameter
-        ``keyword`` filters views by name【985669613019000†L53-L56】. The existing
-        implementation uses the ``search`` query parameter for backward
-        compatibility with earlier clients; both keywords are accepted by the
-        Zoho API as of 2025. If provided, the API returns only views whose
-        metadata matches the keyword. If omitted, all views are returned.
+        Optional search keyword. If provided, the API returns only views
+        whose metadata matches the keyword.
     limit : int
-        Maximum number of results to return. Defaults to 200.
+        Number of results to return. Defaults to 200. According to the
+        API, the field is called ``noOfResult``.
     offset : int
-        Index of the first result to return (pagination). Defaults to 0.
+        Index of the first result to return (pagination). Mapped to
+        ``startIndex`` in the API.
 
     Returns
     -------
     dict
         JSON object containing the list of matching views.
     """
+    import json
+
     if not workspace_id:
         raise ValueError("workspace_id es obligatorio")
     path = f"/restapi/v2/workspaces/{workspace_id}/views"
-    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    # Build CONFIG dict for filtering and pagination
+    config: Dict[str, Any] = {}
+    config["noOfResult"] = limit
+    config["startIndex"] = offset
     if q:
-        # Use the "search" parameter for now; Zoho also supports "keyword" in the CONFIG
-        params["search"] = q
+        # Use 'keyword' field to filter by view name or description
+        config["keyword"] = q
+    # Pass the CONFIG JSON as a single query parameter. requests will URL‑encode it.
+    params = {"CONFIG": json.dumps(config)}
     return _get(path, params)
 
 
@@ -287,33 +302,151 @@ def export_view(
         )
     if r.status_code != 200:
         raise RuntimeError(f"GET {url} -> {r.status_code} {r.text}")
-    return r.json()
+    # Some Zoho Analytics endpoints return JSON with a UTF‑8 BOM. If the
+    # built‑in ``r.json()`` encounters a BOM it raises a JSONDecodeError.
+    try:
+        return r.json()
+    except Exception:
+        import json as _json
+        # Decode bytes with utf‑8‑sig to strip the BOM, then parse
+        content = r.content.decode("utf-8-sig")
+        return _json.loads(content)
 
 
 def query_data(workspace_id: str, sql: str) -> Dict[str, Any]:
-    """Execute a SQL query against the specified workspace.
+    """Execute a SQL query on a workspace using the Bulk API.
 
-    Implements POST ``/restapi/v2/workspaces/{workspace_id}/sql`` with a
-    JSON body ``{"query": sql}``. Returns the query results as a JSON
-    object. Any errors from the server result in a ``RuntimeError``.
+    The Zoho Analytics v2 REST API provides an asynchronous endpoint for
+    executing SQL queries. According to the official MCP description, the
+    `query_data` tool uses a two‑step process: it initiates a bulk export
+    job with the given SQL query and then waits for the job to complete
+    before downloading the result. This implementation follows that
+    pattern.
+
+    Steps:
+      1. Initiate an export job by sending a GET request to
+         ``/restapi/v2/bulk/workspaces/{workspace_id}/data`` with a
+         ``CONFIG`` parameter containing ``sqlQuery`` and ``responseFormat`` set
+         to ``json``【914365997143172†L3346-L3381】.
+      2. Poll the job status via ``/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}``.
+         The job is complete when ``jobStatus`` is ``COMPLETED`` (or a
+         similar value). The polling interval and timeout are configurable via
+         environment variables (fallbacks to 5 seconds interval and 120
+         seconds timeout).
+      3. Once completed, download the data via
+         ``/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}/data`` and
+         return the parsed JSON.
 
     Parameters
     ----------
     workspace_id : str
         Identifier of the workspace. Must not be empty.
     sql : str
-        The SQL query to execute. Must not be empty.
+        SQL query string to execute. Must not be empty.
 
     Returns
     -------
     dict
-        JSON object containing the query results.
+        The result set as returned by Zoho Analytics. If the result is
+        streamed as a file with a BOM, the BOM is stripped before parsing.
+
+    Raises
+    ------
+    ValueError
+        If ``workspace_id`` or ``sql`` is empty.
+    RuntimeError
+        If any HTTP request fails or if the job does not complete within
+        the timeout period.
     """
+    import json
+    import time
+
     if not workspace_id or not sql:
         raise ValueError("workspace_id y sql son obligatorios")
-    path = f"/restapi/v2/workspaces/{workspace_id}/sql"
-    body = {"query": sql}
-    return _post(path, body)
+    # Step 1: initiate export job
+    path_init = f"/restapi/v2/bulk/workspaces/{workspace_id}/data"
+    config = {
+        "sqlQuery": sql,
+        "responseFormat": "json",
+    }
+    params = {"CONFIG": json.dumps(config)}
+    # Use GET for the bulk data initiation
+    url = f"{ANALYTICS_SERVER_URL}{path_init}"
+    r = requests.get(url, headers=_auth_headers(), params=params, timeout=120)
+    if r.status_code == 401:
+        r = requests.get(
+            url,
+            headers=_auth_headers(get_access_token(True)),
+            params=params,
+            timeout=120,
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"GET {url} -> {r.status_code} {r.text}")
+    try:
+        response_data = r.json()
+    except Exception:
+        content = r.content.decode("utf-8-sig")
+        response_data = json.loads(content)
+    job_id = None
+    # The jobId is typically nested under data.jobId
+    if isinstance(response_data, dict):
+        data_section = response_data.get("data") or response_data
+        job_id = data_section.get("jobId")
+    if not job_id:
+        raise RuntimeError(
+            f"No jobId returned when initiating SQL export: {response_data}"
+        )
+    # Step 2: poll job status
+    path_status = f"/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}"
+    status_url = f"{ANALYTICS_SERVER_URL}{path_status}"
+    poll_interval = int(os.getenv("ZC_SQL_POLL_INTERVAL", "5"))  # seconds
+    timeout_secs = int(os.getenv("ZC_SQL_TIMEOUT", "120"))  # total wait time
+    start_time = time.time()
+    job_status = None
+    while True:
+        r_status = requests.get(status_url, headers=_auth_headers(), timeout=60)
+        if r_status.status_code == 401:
+            r_status = requests.get(
+                status_url,
+                headers=_auth_headers(get_access_token(True)),
+                timeout=60,
+            )
+        if r_status.status_code != 200:
+            raise RuntimeError(
+                f"GET {status_url} -> {r_status.status_code} {r_status.text}"
+            )
+        try:
+            status_json = r_status.json()
+        except Exception:
+            status_json = json.loads(r_status.content.decode("utf-8-sig"))
+        data_section = status_json.get("data") or status_json
+        job_status = data_section.get("jobStatus") or data_section.get("status")
+        if job_status and job_status.upper() in {"COMPLETED", "SUCCESS", "FINISHED"}:
+            break
+        # Check timeout
+        if time.time() - start_time > timeout_secs:
+            raise RuntimeError(
+                f"SQL export job {job_id} did not complete within {timeout_secs} seconds"
+            )
+        time.sleep(poll_interval)
+    # Step 3: download the data
+    path_data = f"/restapi/v2/bulk/workspaces/{workspace_id}/exportjobs/{job_id}/data"
+    data_url = f"{ANALYTICS_SERVER_URL}{path_data}"
+    r_data = requests.get(data_url, headers=_auth_headers(), timeout=120)
+    if r_data.status_code == 401:
+        r_data = requests.get(
+            data_url,
+            headers=_auth_headers(get_access_token(True)),
+            timeout=120,
+        )
+    if r_data.status_code != 200:
+        raise RuntimeError(f"GET {data_url} -> {r_data.status_code} {r_data.text}")
+    # Attempt to parse JSON; strip BOM if present
+    try:
+        return r_data.json()
+    except Exception:
+        content = r_data.content.decode("utf-8-sig")
+        return json.loads(content)
 
 
 def health_info() -> Dict[str, Any]:
@@ -336,4 +469,4 @@ __all__ = [
     "export_view",
     "query_data",
     "health_info",
-    ]
+]

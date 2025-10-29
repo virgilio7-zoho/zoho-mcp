@@ -1,37 +1,14 @@
-# app/main.py
 from __future__ import annotations
-
-import os
-import logging
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import Any, Optional
+from .config import settings
+from .zoho_client import export_sql, export_view_or_table, get_access_token
 
-# Importa las funciones/errores del cliente Zoho
-from .zoho_client import (
-    view_smart as z_view_smart,
-    ZohoAuthError,
-    ZohoApiError,
-)
+app = FastAPI(title="Zoho Analytics MCP", version="1.0.0")
 
-# -----------------------------------------------------------------------------
-# Configuración básica
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
-log = logging.getLogger("zoho-mcp")
-
-app = FastAPI(
-    title="Zoho MCP",
-    version="1.0.0",
-    description="Servicio mínimo para exportar vistas de Zoho Analytics por API.",
-)
-
-# CORS abierto (útil para probar desde Postman/Swagger o páginas internas)
+# CORS abierto para pruebas
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,118 +17,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Modelos de entrada/salida
-# -----------------------------------------------------------------------------
-class ViewSmartIn(BaseModel):
-    owner: str = Field(..., description="Cuenta propietaria (email codificable).")
-    orgowner: str = Field(..., description="Org owner (no se usa en C1, se acepta para compat).")
-    workspace: str = Field(..., description="Nombre del Workspace.")
-    workspace_id: Optional[str] = Field(None, description="ID del Workspace (opcional).")
-    view: str = Field(..., description="Nombre de la vista/tabla en Zoho.")
-    limit: int = Field(100, ge=1, le=10000, description="Límite de filas a traer.")
-    offset: int = Field(0, ge=0, description="Desplazamiento para paginación.")
+class QueryRequest(BaseModel):
+    sql: str = Field(..., description="Consulta SQL completa")
+    workspace: Optional[str] = Field(None, description="Workspace; default env")
+    # No imponemos limit aquí, lo haces en SQL si quieres.
 
-class ViewSmartOut(BaseModel):
-    source_url: str
-    columns: list
-    rows: list
+class ViewSmartRequest(BaseModel):
+    view: str = Field(..., description="Nombre de vista/tabla EXACTO en Zoho")
+    workspace: Optional[str] = None
+    limit: Optional[int] = Field(None, ge=1, le=20000)
+    offset: Optional[int] = Field(0, ge=0)
 
-class HealthOut(BaseModel):
-    ok: bool
-    message: str
-    dc: str
-    has_token: bool
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/", response_model=dict)
-def root():
-    """
-    Ping de bienvenida.
-    """
-    return {"ok": True, "service": "zoho-mcp", "endpoints": ["/docs", "/health", "/debug/has_token", "/view_smart"]}
-
-
-@app.get("/health", response_model=HealthOut)
+@app.get("/health")
 def health():
-    """
-    Salud básica del servicio:
-    - Detecta presencia de ZOHO_ACCESS_TOKEN (sin validarlo contra Zoho).
-    - Muestra el DC configurado.
-    """
-    dc = os.getenv("ZOHO_DC", "com").strip() or "com"
-    has_token = bool(os.getenv("ZOHO_ACCESS_TOKEN"))
-    msg = "OK" if has_token else "Falta ZOHO_ACCESS_TOKEN"
-    return HealthOut(ok=has_token, message=msg, dc=dc, has_token=has_token)
+    return {"status": "UP", "workspace": settings.ZOHO_WORKSPACE}
 
-
-@app.get("/debug/has_token", response_model=dict)
-def debug_has_token():
+@app.get("/token-check")
+def token_check():
     """
-    Endpoint de diagnóstico: muestra si el token está presente.
-    *No* devuelve el token por seguridad.
-    """
-    return {"has_token": bool(os.getenv("ZOHO_ACCESS_TOKEN", ""))}
-
-
-@app.post("/view_smart", response_model=ViewSmartOut)
-def view_smart(inb: ViewSmartIn):
-    """
-    Exporta datos de una vista/tabla de Zoho Analytics.
-    Implementa la estrategia validada:
-      1) Intenta REST v2 (views/tables).
-      2) Fallback al EXPORT JSON 'simple path' /api/{owner}/{workspace}/{view}.
+    Intenta renovar un access token y lo oculta.
+    Útil para verificar configuración OAuth/entorno.
     """
     try:
-        data = z_view_smart(
-            owner=inb.owner,
-            orgowner=inb.orgowner,
-            workspace=inb.workspace,
-            workspace_id=inb.workspace_id or "",
-            view=inb.view,
-            limit=inb.limit,
-            offset=inb.offset,
-        )
-        # Normaliza salida al esquema ViewSmartOut
-        return ViewSmartOut(
-            source_url=data.get("source_url", ""),
-            columns=data.get("columns", []),
-            rows=data.get("rows", []),
-        )
-    except ZohoAuthError as e:
-        # Token faltante o inválido en entorno
-        log.error("Auth error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except ZohoApiError as e:
-        # No se pudo exportar por ninguna ruta
-        log.error("Zoho API error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        token = get_access_token()
+        return {"ok": True, "token_len": len(token)}
     except Exception as e:
-        log.exception("Unexpected error in /view_smart")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# Nota de ejecución (Render)
-# -----------------------------------------------------------------------------
-# En Render, asegúrate de:
-# - Environment Variables:
-#     ZOHO_ACCESS_TOKEN = <tu_token_oauth_vigente>
-#     ZOHO_DC           = com   (o eu/in segun tu data center)
-# - Start command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-# - Probar en /docs -> POST /view_smart
-#
-# Campos típicos para /view_smart:
-# {
-#   "owner": "vacevedo@markem.com.co",
-#   "orgowner": "697009942",
-#   "workspace": "MARKEM",
-#   "workspace_id": "2086177000000002085",
-#   "view": "VENDEDORES_DIFERENTES_COMPLETO",
-#   "limit": 50,
-#   "offset": 0
-# }
-#
-# Si una vista con espacios falla, prueba con guion o underscore según naming real,
-# y recuerda que el cliente internamente codifica el nombre para URL.
+@app.post("/query")
+def run_query(req: QueryRequest = Body(...)):
+    try:
+        data = export_sql(req.sql, workspace=req.workspace)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/view_smart")
+def view_smart(req: ViewSmartRequest = Body(...)):
+    try:
+        data = export_view_or_table(
+            view_or_table=req.view,
+            workspace=req.workspace,
+            limit=req.limit,
+            offset=req.offset,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+def root():
+    return {
+        "name": "Zoho Analytics MCP",
+        "docs": "/docs",
+        "health": "/health",
+        "query": "/query (POST)",
+        "view": "/view_smart (POST)"
+    }

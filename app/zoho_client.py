@@ -151,3 +151,66 @@ def export_view_or_table(
         raise RuntimeError("Faltan ZOHO_OWNER_ORG/ZOHO_WORKSPACE.")
     token = get_access_token()
     return smart_view_export(owner, ws, view_or_table, token, limit or DEFAULT_LIMIT, offset)
+    # ================================================================
+# 🔎 SQL Export (C1) — POST form-encoded
+# ================================================================
+def export_sql(sql: str, workspace: Optional[str] = None) -> dict:
+    """
+    Ejecuta una consulta SQL en Zoho Analytics usando el API clásico (C1).
+    Requiere permisos de lectura sobre las tablas referenciadas.
+    """
+    if not sql or not sql.strip():
+        raise ValueError("sql no puede estar vacío")
+
+    owner = ZOHO_OWNER_ORG
+    ws = workspace or ZOHO_WORKSPACE
+    if not owner or not ws:
+        raise RuntimeError("Faltan ZOHO_OWNER_ORG/ZOHO_WORKSPACE.")
+
+    token = get_access_token()
+    return _sql_export(owner, ws, sql, token)
+
+
+def _sql_export(owner_email: str, workspace: str, sql: str, access_token: str) -> dict:
+    """
+    Implementación de SQL EXPORT por POST (form-encoded).
+    Endpoint: {base}/{owner}/{workspace}/sql
+    """
+    base = _api_base()
+    owner_enc = quote(owner_email, safe="")
+    workspace_enc = quote(workspace, safe="")
+    url = f"{base}/{owner_enc}/{workspace_enc}/sql"
+
+    form = {
+        "ZOHO_ACTION": "EXPORT",
+        "ZOHO_OUTPUT_FORMAT": "JSON",
+        "ZOHO_API_VERSION": "1.0",
+        "ZOHO_ERROR_FORMAT": "JSON",
+        "ZOHO_SQL_QUERY": sql,
+    }
+
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    print(f"[SQL][C1] POST {url}")
+    resp = requests.post(url, headers=headers, data=form, timeout=90)
+
+    if resp.status_code == 401 and "invalid_token" in resp.text:
+        print("🔑 Token expirado (SQL). Refrescando…")
+        new_token = get_access_token(force_refresh=True)
+        headers["Authorization"] = f"Zoho-oauthtoken {new_token}"
+        resp = requests.post(url, headers=headers, data=form, timeout=90)
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"sql_export failed.\nURL: {resp.url}\nStatus: {resp.status_code}\nBody: {resp.text}"
+        )
+
+    try:
+        return resp.json()
+    except Exception:
+        raise RuntimeError(f"No se pudo parsear JSON (SQL).\nBody: {resp.text[:500]}")
+

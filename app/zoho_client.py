@@ -1,97 +1,108 @@
-# app/zoho_client.py
-import os
-import json
+from __future__ import annotations
 import time
-import urllib.parse
+from typing import Any, Dict, Tuple
 import requests
+from urllib.parse import quote
+from .config import settings
 
-ZOHO_DC = os.getenv("ZOHO_DC", "com").strip() or "com"
-BASE_REST = f"https://analyticsapi.zoho.{ZOHO_DC}"
-USER_AGENT = "zoho-mcp/1.0 (+render)"
+# Cache simple en memoria para el access_token
+_ACCESS_TOKEN: str | None = None
+_ACCESS_TOKEN_EXP: float | None = None  # epoch seconds
 
-class ZohoAuthError(RuntimeError): ...
-class ZohoApiError(RuntimeError): ...
+def _now() -> float:
+    return time.time()
 
-def _access_token() -> str:
-    token = os.getenv("ZOHO_ACCESS_TOKEN")
-    if not token:
-        raise ZohoAuthError("Falta ZOHO_ACCESS_TOKEN en variables de entorno.")
-    return token.strip()
+def get_access_token() -> str:
+    """
+    Obtiene (o renueva) el access token usando el refresh token.
+    Guarda en cache hasta ~55 minutos.
+    """
+    global _ACCESS_TOKEN, _ACCESS_TOKEN_EXP
+    if _ACCESS_TOKEN and _ACCESS_TOKEN_EXP and _now() < _ACCESS_TOKEN_EXP:
+        return _ACCESS_TOKEN
 
-def _auth_headers():
-    return {
-        "Authorization": f"Zoho-oauthtoken {_access_token()}",
-        "Accept": "application/json",
-        "User-Agent": USER_AGENT,
+    token_url = f"{settings.ZOHO_ACCOUNTS_BASE}/oauth/v2/token"
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": settings.ZOHO_REFRESH_TOKEN,
+        "client_id": settings.ZOHO_CLIENT_ID,
+        "client_secret": settings.ZOHO_CLIENT_SECRET,
     }
+    resp = requests.post(token_url, data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Error renovando access_token: {resp.status_code} {resp.text}"
+        )
+    payload = resp.json()
+    access = payload.get("access_token")
+    if not access:
+        raise RuntimeError(f"Respuesta sin access_token: {payload}")
 
-def _get(url: str, params=None):
-    r = requests.get(url, headers=_auth_headers(), params=params, timeout=60)
-    return r.status_code, r.text
+    # Zoho típicamente expira en 3600s; usamos 3300 para margen
+    _ACCESS_TOKEN = access
+    _ACCESS_TOKEN_EXP = _now() + float(payload.get("expires_in", 3600)) - 300
+    return _ACCESS_TOKEN
 
-def _post(url: str, data=None, form=False):
-    headers = _auth_headers()
-    if form:
-        r = requests.post(url, headers=headers, data=data, timeout=120)
-    else:
-        headers["Content-Type"] = "application/json"
-        r = requests.post(url, headers=headers, json=data, timeout=120)
-    return r.status_code, r.text
+def _auth_headers() -> Dict[str, str]:
+    return {"Authorization": f"Zoho-oauthtoken {get_access_token()}"}
 
-def smart_view_export(owner: str, orgowner: str, workspace: str, view: str,
-                      limit: int = 100, offset: int = 0) -> dict:
+def _api(path: str) -> str:
+    return f"{settings.ZOHO_ANALYTICS_API_BASE}{path}"
+
+def export_sql(sql: str, workspace: str | None = None) -> Dict[str, Any]:
     """
-    Estrategia:
-      1) Rutas REST v2 (views/tables)  -> suelen fallar con 404/400
-      2) Ruta EXPORT JSON 'simple path' -> /api/{owner}/{ws}/{view}
-    Devuelve dict con: columns, rows, source_url
+    Exporta resultado de una consulta SQL en JSON.
+    Usa el endpoint 'simple' que ha mostrado mejor compatibilidad:
+    /api/{owner}/{workspace}/sql  (EXPORT -> JSON)
     """
-    view_enc = urllib.parse.quote(view, safe="")
-    ws_enc = urllib.parse.quote(workspace, safe="")
+    owner = settings.ZOHO_OWNER_ORG
+    ws = workspace or settings.ZOHO_WORKSPACE
+    # Cuidado con caracteres: owner puede ser numérico u org key; no escapamos el slash.
+    path = f"/api/{quote(owner, safe='')}/{quote(ws, safe='')}/sql"
+    url = _api(path)
 
-    trials = []
+    # Parámetros estilo Zoho Analytics EXPORT
+    form = {
+        "ZOHO_ACTION": "EXPORT",
+        "ZOHO_OUTPUT_FORMAT": "JSON",
+        "ZOHO_ERROR_FORMAT": "JSON",
+        "SQLQUERY": sql,
+    }
+    r = requests.post(url, headers=_auth_headers(), data=form, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"SQL export error {r.status_code}: {r.text}")
+    return r.json()
 
-    # A) REST v2 (views)
-    url = f"{BASE_REST}/restapi/v2/workspaces/{ws_enc}/views/{view_enc}/data"
-    status, body = _get(url, params={"limit": limit, "offset": offset})
-    if status == 200:
-        payload = json.loads(body)
-        cols = payload.get("columns", [])
-        rows = payload.get("rows", [])
-        return {"columns": cols, "rows": rows, "source_url": url}
-    trials.append(("A-views", url, status, body[:400]))
+def export_view_or_table(
+    view_or_table: str,
+    workspace: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+) -> Dict[str, Any]:
+    """
+    Exporta una vista/tabla en JSON usando el 'simple path' que te funcionó:
+    /api/{owner}/{workspace}/{view_or_table}?EXPORT JSON
 
-    # A2) REST v2 (tables)
-    url = f"{BASE_REST}/restapi/v2/workspaces/{ws_enc}/tables/{view_enc}/data"
-    status, body = _get(url, params={"limit": limit, "offset": offset})
-    if status == 200:
-        payload = json.loads(body)
-        cols = payload.get("columns", [])
-        rows = payload.get("rows", [])
-        return {"columns": cols, "rows": rows, "source_url": url}
-    trials.append(("A-tables", url, status, body[:400]))
+    Se agregan LIMIT y OFFSET para paginar y evitar OOM.
+    """
+    owner = settings.ZOHO_OWNER_ORG
+    ws = workspace or settings.ZOHO_WORKSPACE
+    lim = limit or settings.DEFAULT_LIMIT
+    off = offset or 0
 
-    # C1) EXPORT JSON simple path (este es el que te funcionó)
-    # Nota: aquí NO va /data ni /export, es el recurso directo.
-    owner_enc = urllib.parse.quote(owner, safe="")
-    url = f"{BASE_REST}/api/{owner_enc}/{ws_enc}/{view_enc}"
-    status, body = _get(url, params={"ZOHO_OUTPUT_FORMAT": "json"})
-    if status == 200:
-        payload = json.loads(body)
-        # El formato de EXPORT trae 'response/results/columns/rows' típico
-        resp = payload.get("response", {})
-        results = resp.get("result", resp.get("results", {}))
-        columns = results.get("column_order") or results.get("columns") or []
-        rows = results.get("rows") or results.get("data") or []
-        return {"columns": columns, "rows": rows, "source_url": url}
-    trials.append(("C1-export", url, status, body[:400]))
+    path = f"/api/{quote(owner, safe='')}/{quote(ws, safe='')}/{quote(view_or_table, safe='')}"
+    url = _api(path)
 
-    # Si nada funcionó, lanza error con diagnóstico corto
-    diag = "\n".join([f"[{k}] {u} -> {s} {b}" for (k, u, s, b) in trials])
-    raise ZohoApiError(f"smart_view_export failed.\n{diag}")
-
-# Atajo que usa el endpoint /view_smart
-def view_smart(owner: str, orgowner: str, workspace: str, workspace_id: str,
-               view: str, limit: int = 100, offset: int = 0) -> dict:
-    # workspace_id hoy no es estrictamente necesario para la ruta C1.
-    return smart_view_export(owner, orgowner, workspace, view, limit, offset)
+    form = {
+        "ZOHO_ACTION": "EXPORT",
+        "ZOHO_OUTPUT_FORMAT": "JSON",
+        "ZOHO_ERROR_FORMAT": "JSON",
+        "LIMIT": str(lim),
+        "OFFSET": str(off),
+    }
+    r = requests.post(url, headers=_auth_headers(), data=form, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Export view error {r.status_code} url={url} body={r.text}"
+        )
+    return r.json()

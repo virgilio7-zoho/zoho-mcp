@@ -1,26 +1,29 @@
-import os
+# app/config.py
+from pydantic import BaseSettings, Field
 
-def getenv_str(name: str, default: str | None = None) -> str:
-    v = os.getenv(name, default)
-    if v is None or v == "":
-        raise RuntimeError(f"Falta {name} en variables de entorno.")
-    return v
 
-class Settings:
-    # Bases (permite cambiar a EU u otros)
-    ZOHO_ACCOUNTS_BASE = os.getenv("ZOHO_ACCOUNTS_BASE", "https://accounts.zoho.com")
-    ZOHO_ANALYTICS_API_BASE = os.getenv("ZOHO_ANALYTICS_API_BASE", "https://analyticsapi.zoho.com")
+class Settings(BaseSettings):
+    # Región/host (ajústalo si usas .eu / .in)
+    ZOHO_ACCOUNTS_BASE: str = Field(default="https://accounts.zoho.com")
+    ZOHO_ANALYTICS_API_BASE: str = Field(default="https://analyticsapi.zoho.com")
+
+    # Identidad y workspace por defecto
+    ZOHO_OWNER_ORG: str = Field(..., description="Email u OrgID dueño del workspace, ej: 697009942 o vacevedo@...")  # obligatorio
+    ZOHO_WORKSPACE: str = Field(..., description='Nombre del workspace, ej: "MARKEM"')  # obligatorio
 
     # OAuth
-    ZOHO_CLIENT_ID = getenv_str("ZOHO_CLIENT_ID")
-    ZOHO_CLIENT_SECRET = getenv_str("ZOHO_CLIENT_SECRET")
-    ZOHO_REFRESH_TOKEN = getenv_str("ZOHO_REFRESH_TOKEN")
+    ZOHO_ACCESS_TOKEN: str | None = None
+    ZOHO_REFRESH_TOKEN: str | None = None
+    ZOHO_CLIENT_ID: str | None = None
+    ZOHO_CLIENT_SECRET: str | None = None
 
-    # Contexto de Analytics (owner/org + workspace)
-    ZOHO_OWNER_ORG = getenv_str("ZOHO_OWNER_ORG")
-    ZOHO_WORKSPACE = getenv_str("ZOHO_WORKSPACE")
+    # Límites por defecto
+    DEFAULT_LIMIT: int = 100
 
-    # Límite por defecto para evitar OOM en Render (512MB)
-    DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "1000"))
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
 
 settings = Settings()
+DEFAULT_LIMIT = settings.DEFAULT_LIMIT

@@ -102,6 +102,45 @@ def well_known_oauth_protected_resource_sub(subpath: str) -> dict:
     """Catch-all for OAuth protected resource subpaths."""
     return {}
 
+#---------------------------------------------------------------------
+# Well-known endpoints under the /mcp prefix
+#
+# Some MCP clients (including ChatGPT) incorrectly request well-known
+# discovery documents under the /mcp prefix. FastAPI treats paths
+# literally, so these requests would otherwise return 404. We mirror
+# the top-level /.well-known routes under /mcp/.well-known to avoid
+# these errors. The handlers return the same minimal JSON objects as
+# their top-level counterparts.
+
+@app.get("/mcp/.well-known/openid-configuration", include_in_schema=False)
+def mcp_well_known_openid_config() -> dict:
+    return {}
+
+
+@app.get("/mcp/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
+def mcp_well_known_openid_config_sub(subpath: str) -> dict:
+    return {}
+
+
+@app.get("/mcp/.well-known/oauth-authorization-server", include_in_schema=False)
+def mcp_well_known_oauth_authorization_server() -> dict:
+    return {}
+
+
+@app.get("/mcp/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
+def mcp_well_known_oauth_authorization_server_sub(subpath: str) -> dict:
+    return {}
+
+
+@app.get("/mcp/.well-known/oauth-protected-resource", include_in_schema=False)
+def mcp_well_known_oauth_protected_resource() -> dict:
+    return {}
+
+
+@app.get("/mcp/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
+def mcp_well_known_oauth_protected_resource_sub(subpath: str) -> dict:
+    return {}
+
 
 # ---------- Health ----------
 @app.get("/health")

@@ -140,7 +140,7 @@ def oauth_authorize(
     # Guardamos por 2 minutos el code (client_id y redirect solo informativos)
     from typing import Tuple
     global _OAUTH_CODES
-    _OAUTH_CODES[code] = (time.time() + 120, client_id, redirect_uri)  # type: ignore
+    _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)  # type: ignore
 
     sep = "&" if "?" in redirect_uri else "?"
     return RedirectResponse(url=f"{redirect_uri}{sep}code={code}&state={state}")
@@ -155,56 +155,67 @@ def _body_value(body: dict, name: str, default=None):
     return default
 
 @app.post("/token", include_in_schema=False)
-async def oauth_token(
-    request: Request,
-    # JSON (opcionales)
-    grant_type_json: Optional[str] = Body(None, embed=True),
-    code_json: Optional[str] = Body(None, embed=True),
-    redirect_uri_json: Optional[str] = Body(None, embed=True),
-    client_id_json: Optional[str] = Body(None, embed=True),
-    refresh_token_json: Optional[str] = Body(None, embed=True),
-    code_verifier_json: Optional[str] = Body(None, embed=True),
-    # FORM (opcionales)
-    grant_type_form: Optional[str] = Form(None),
-    code_form: Optional[str] = Form(None),
-    redirect_uri_form: Optional[str] = Form(None),
-    client_id_form: Optional[str] = Form(None),
-    refresh_token_form: Optional[str] = Form(None),
-    code_verifier_form: Optional[str] = Form(None),
-):
-    """Canjea authorization_code por access_token o refresh_token por uno nuevo."""
-    if request.headers.get("content-type","").startswith("application/json"):
-        body = {
-            "grant_type": grant_type_json, "code": code_json,
-            "redirect_uri": redirect_uri_json, "client_id": client_id_json,
-            "refresh_token": refresh_token_json, "code_verifier": code_verifier_json,
-        }
-    else:
-        body = {
-            "grant_type": grant_type_form, "code": code_form,
-            "redirect_uri": redirect_uri_form, "client_id": client_id_form,
-            "refresh_token": refresh_token_form, "code_verifier": code_verifier_form,
-        }
+async def oauth_token(request: Request):
+    """
+    Canjea authorization_code por access_token o refresh_token por uno nuevo.
+    Parseo robusto: form-url-encoded, JSON o querystring.
+    """
+    # 1) Parseo del body
+    ctype = (request.headers.get("content-type") or "").lower()
+    data = {}
 
-    grant_type = _body_value(body, "grant_type")
+    # Intentar como form (PowerShell, curl, la mayoría de clientes OAuth)
+    if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
+        try:
+            form = await request.form()
+            data = dict(form)
+        except Exception:
+            data = {}
+
+    # Si no había form, intentar JSON
+    if not data:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+    # 2) También aceptamos parámetros por query (seguro y útil para debug)
+    qp = dict(request.query_params)
+    def pick(name: str, default=None):
+        return data.get(name) or qp.get(name) or default
+
+    grant_type   = pick("grant_type")
+    code         = pick("code")
+    redirect_uri = pick("redirect_uri", "")
+    client_id    = pick("client_id", "")
+    refresh_tok  = pick("refresh_token")
+    # (code_verifier no lo validamos en este AS mínimo)
+
     if grant_type not in ("authorization_code", "refresh_token"):
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
+    # --- authorization_code flow ---
     if grant_type == "authorization_code":
-        code = _body_value(body, "code")
         if not code:
             raise HTTPException(status_code=400, detail="invalid_request")
-        data = _OAUTH_CODES.pop(code, None)
-        if not data:
+
+        # Buscar el code emitido en /authorize
+        data_tuple = _OAUTH_CODES.pop(code, None)
+        if not data_tuple:
             raise HTTPException(status_code=400, detail="invalid_grant")
-        exp_ts, _client, _redir = data
+
+        exp_ts, expected_client, expected_redirect = data_tuple
         if exp_ts < time.time():
             raise HTTPException(status_code=400, detail="invalid_grant")
 
-        access_token = secrets.token_urlsafe(32)
+        # (Opcional: validar client_id/redirect_uri si quieres)
+        # if expected_client and client_id and client_id != expected_client: ...
+        # if expected_redirect and redirect_uri and redirect_uri != expected_redirect: ...
+
+        access_token  = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
-        _OAUTH_TOKENS[access_token] = time.time() + 3600        # 1h
-        _OAUTH_REFRESH[refresh_token] = time.time() + 30*24*3600 # 30 días
+        _OAUTH_TOKENS[access_token]   = time.time() + 3600          # 1h
+        _OAUTH_REFRESH[refresh_token] = time.time() + 30*24*3600     # 30 días
         return {
             "token_type": "Bearer",
             "access_token": access_token,
@@ -213,11 +224,10 @@ async def oauth_token(
             "scope": "default",
         }
 
-    # refresh_token
-    refresh_token = _body_value(body, "refresh_token")
-    if not refresh_token:
+    # --- refresh_token flow ---
+    if not refresh_tok:
         raise HTTPException(status_code=400, detail="invalid_request")
-    exp = _OAUTH_REFRESH.get(refresh_token)
+    exp = _OAUTH_REFRESH.get(refresh_tok)
     if not exp or exp < time.time():
         raise HTTPException(status_code=400, detail="invalid_grant")
 
@@ -227,9 +237,10 @@ async def oauth_token(
         "token_type": "Bearer",
         "access_token": access_token,
         "expires_in": 3600,
-        "refresh_token": refresh_token,
+        "refresh_token": refresh_tok,
         "scope": "default",
     }
+
 # ============================================================================== 
 
 # ---------- Health ----------

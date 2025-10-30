@@ -547,26 +547,7 @@ async def mcp_invoke(
                     "serverInfo": server_info,
                 },
             }
-
-# Support trailing slash in the MCP endpoint. Some MCP clients may
-# invoke ``/mcp/`` instead of ``/mcp``. FastAPI treats these as
-# distinct paths for POST requests, so we register an alias that
-# delegates to the main ``mcp_invoke`` handler.
-@app.post("/mcp/")
-async def mcp_invoke_alias(
-    payload: Optional[dict] = Body(
-        default=None,
-        description=(
-            "JSON‑RPC request payload. See ``/mcp`` for details."
-        ),
-    ),
-    request: Request = None,
-):
-    # Delegate to the main mcp_invoke handler. We explicitly pass the
-    # payload and request so the logic remains the same.
-    return await mcp_invoke(payload=payload, request=request)
-
-        # Tool execution
+        # Tool execution (within JSON‑RPC handler)
         if method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments", {}) or {}
@@ -627,7 +608,7 @@ async def mcp_invoke_alias(
                     "error": {"code": -32000, "message": str(exc)}
                 })
 
-        # Unknown method
+        # Unknown method for JSON‑RPC 2.0
         return JSONResponse(status_code=404, content={
             "jsonrpc": "2.0",
             "id": jsonrpc_id,
@@ -681,3 +662,21 @@ async def mcp_invoke_alias(
 
     # If the payload does not match any known format, return an error.
     return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request"}})
+
+# Support trailing slash in the MCP endpoint. Some MCP clients may
+# invoke ``/mcp/`` instead of ``/mcp``. FastAPI treats these as
+# distinct paths for POST requests, so we register an alias that
+# delegates to the main ``mcp_invoke`` handler.
+@app.post("/mcp/")
+async def mcp_invoke_alias(
+    payload: Optional[dict] = Body(
+        default=None,
+        description=(
+            "JSON‑RPC request payload. See ``/mcp`` for details."
+        ),
+    ),
+    request: Request = None,
+):
+    # Delegate to the main mcp_invoke handler. We explicitly pass the
+    # payload and request so the logic remains the same.
+    return await mcp_invoke(payload=payload, request=request)

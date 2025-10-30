@@ -173,9 +173,9 @@ async def oauth_token(request: Request):
     """
     # 1) Parseo del body
     ctype = (request.headers.get("content-type") or "").lower()
-    data = {}
+    data: dict = {}
 
-    # Intentar como form (PowerShell, curl, la mayoría de clientes OAuth)
+    # a) Intentar como form (PowerShell, curl, la mayoría de clientes OAuth)
     if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
         try:
             form = await request.form()
@@ -183,29 +183,29 @@ async def oauth_token(request: Request):
         except Exception:
             data = {}
 
-    # Si no había form, intentar JSON
+    # b) Si no había form, intentar JSON
     if not data:
         try:
             data = await request.json()
         except Exception:
             data = {}
 
-    # 2) También aceptamos parámetros por query (seguro y útil para debug)
+    # c) También aceptamos parámetros por query (útil para debug)
     qp = dict(request.query_params)
+
     def pick(name: str, default=None):
-        return data.get(name) or qp.get(name) or default
+        return (data.get(name) or qp.get(name) or default)
 
     grant_type   = pick("grant_type")
     code         = pick("code")
     redirect_uri = pick("redirect_uri", "")
     client_id    = pick("client_id", "")
     refresh_tok  = pick("refresh_token")
-    # (code_verifier no lo validamos en este AS mínimo)
 
     if grant_type not in ("authorization_code", "refresh_token"):
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
-    # --- authorization_code flow ---
+    # ================= authorization_code =================
     if grant_type == "authorization_code":
         if not code:
             raise HTTPException(status_code=400, detail="invalid_request")
@@ -219,45 +219,43 @@ async def oauth_token(request: Request):
         if exp_ts < time.time():
             raise HTTPException(status_code=400, detail="invalid_grant")
 
-        # (Opcional: validar client_id/redirect_uri si quieres)
+        # (Opcional) validar client_id/redirect_uri
         # if expected_client and client_id and client_id != expected_client: ...
         # if expected_redirect and redirect_uri and redirect_uri != expected_redirect: ...
 
         access_token  = secrets.token_urlsafe(32)
-refresh_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
 
-_OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
-_OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
+        _OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
+        _OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
 
-return {
-    "token_type": "Bearer",
-    "access_token": access_token,
-    "expires_in": ACCESS_TTL_SECONDS,
-    "refresh_token": refresh_token,
-    "scope": "default",
-}
+        return {
+            "token_type": "Bearer",
+            "access_token": access_token,
+            "expires_in": ACCESS_TTL_SECONDS,
+            "refresh_token": refresh_token,
+            "scope": "default",
+        }
 
-
-    # --- refresh_token flow ---
+    # ================= refresh_token =================
     if not refresh_tok:
         raise HTTPException(status_code=400, detail="invalid_request")
+
     exp = _OAUTH_REFRESH.get(refresh_tok)
     if not exp or exp < time.time():
         raise HTTPException(status_code=400, detail="invalid_grant")
 
     access_token = secrets.token_urlsafe(32)
-_OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
+    _OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
 
-return {
-    "token_type": "Bearer",
-    "access_token": access_token,
-    "expires_in": ACCESS_TTL_SECONDS,
-    "refresh_token": refresh_tok,   # mantenemos el mismo refresh
-    "scope": "default",
-}
+    return {
+        "token_type": "Bearer",
+        "access_token": access_token,
+        "expires_in": ACCESS_TTL_SECONDS,
+        "refresh_token": refresh_tok,  # mismo refresh de larga duración
+        "scope": "default",
+    }
 
-
-# ============================================================================== 
 
 # ---------- Health ----------
 @app.get("/health")

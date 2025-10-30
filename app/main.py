@@ -47,6 +47,17 @@ _OAUTH_TOKENS: dict[str, float] = {}   # access_token -> exp_ts
 _OAUTH_CODES: dict[str, tuple[float, str, str]] = {}
 # refresh_token -> exp_ts
 _OAUTH_REFRESH: dict[str, float] = {}
+# === TTL configurables (por env) ===
+ACCESS_TTL_SECONDS = int(os.getenv("ACCESS_TTL_SECONDS", "3600"))   # access token: 1h
+REFRESH_TTL_DAYS   = int(os.getenv("REFRESH_TTL_DAYS",   "3650"))   # refresh: ~10 años
+
+# (Opcional, para sobrevivir reinicios) Seed de refresh tokens conocidos
+PRESEEDED_REFRESH_TOKENS = [
+    t.strip() for t in (os.getenv("PRESEEDED_REFRESH_TOKENS", "")).split(",") if t.strip()
+]
+for _rt in PRESEEDED_REFRESH_TOKENS:
+    _OAUTH_REFRESH[_rt] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
+
 def _bearer_valid(auth_header: str | None) -> bool:
     if not auth_header or not auth_header.lower().startswith("bearer "):
         return False
@@ -213,16 +224,19 @@ async def oauth_token(request: Request):
         # if expected_redirect and redirect_uri and redirect_uri != expected_redirect: ...
 
         access_token  = secrets.token_urlsafe(32)
-        refresh_token = secrets.token_urlsafe(32)
-        _OAUTH_TOKENS[access_token]   = time.time() + 3600          # 1h
-        _OAUTH_REFRESH[refresh_token] = time.time() + 30*24*3600     # 30 días
-        return {
-            "token_type": "Bearer",
-            "access_token": access_token,
-            "expires_in": 3600,
-            "refresh_token": refresh_token,
-            "scope": "default",
-        }
+refresh_token = secrets.token_urlsafe(32)
+
+_OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
+_OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
+
+return {
+    "token_type": "Bearer",
+    "access_token": access_token,
+    "expires_in": ACCESS_TTL_SECONDS,
+    "refresh_token": refresh_token,
+    "scope": "default",
+}
+
 
     # --- refresh_token flow ---
     if not refresh_tok:
@@ -232,14 +246,16 @@ async def oauth_token(request: Request):
         raise HTTPException(status_code=400, detail="invalid_grant")
 
     access_token = secrets.token_urlsafe(32)
-    _OAUTH_TOKENS[access_token] = time.time() + 3600
-    return {
-        "token_type": "Bearer",
-        "access_token": access_token,
-        "expires_in": 3600,
-        "refresh_token": refresh_tok,
-        "scope": "default",
-    }
+_OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
+
+return {
+    "token_type": "Bearer",
+    "access_token": access_token,
+    "expires_in": ACCESS_TTL_SECONDS,
+    "refresh_token": refresh_tok,   # mantenemos el mismo refresh
+    "scope": "default",
+}
+
 
 # ============================================================================== 
 

@@ -20,7 +20,8 @@ starting this server; otherwise the client will raise runtime errors.
 See ``config.py`` for the list of variables and their descriptions.
 """
 
-from fastapi import FastAPI, Query, Body, Request
+import os
+from fastapi import FastAPI, Query, Body, Request, Header, Depends, HTTPException
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -40,6 +41,16 @@ from .zoho_client import (
     export_view,
     query_data,
 )
+# --- API Key simple (protege los endpoints de datos) ---
+API_KEY = os.getenv("API_KEY", "")
+
+def require_key(x_api_key: str | None = Header(None)):
+    """
+    Verifica que el cliente envía X-API-Key válida.
+    Configura API_KEY como variable de entorno en Render.
+    """
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
 app = FastAPI(title="Zoho Analytics MCP (v2) — Tools oficiales")
@@ -155,7 +166,7 @@ def health() -> dict:
 
 
 # ---------- get_workspaces_list ----------
-@app.get("/workspaces_v2")
+@app.get("/workspaces_v2", dependencies=[Depends(require_key)])
 def workspaces_v2() -> dict:
     """List all workspaces available to the authenticated user.
 
@@ -168,7 +179,7 @@ def workspaces_v2() -> dict:
 
 
 # ---------- search_views ----------
-@app.get("/views_v2")
+@app.get("/views_v2", dependencies=[Depends(require_key)])
 def views_v2(
     workspace_id: str = Query(..., description="Workspace ID"),
     q: str | None = Query(None, description="Texto a buscar"),
@@ -200,7 +211,7 @@ def views_v2(
 
 
 # ---------- get_view_details ----------
-@app.get("/view_details_v2")
+@app.get("/view_details_v2", dependencies=[Depends(require_key)])
 def view_details_v2(
     workspace_id: str = Query(
         ...,
@@ -242,7 +253,7 @@ class ExportViewBody(BaseModel):
     offset: int = Field(0, ge=0)
 
 
-@app.post("/export_view_v2")
+@app.post("/export_view_v2", dependencies=[Depends(require_key)])
 def export_view_v2(payload: ExportViewBody = Body(...)) -> dict:
     """Export data from a specific view.
 
@@ -264,7 +275,7 @@ class QueryBody(BaseModel):
     sql: str = Field(..., description="Consulta SQL")
 
 
-@app.post("/query_v2")
+@app.post("/query_v2", dependencies=[Depends(require_key)])
 def query_v2(payload: QueryBody = Body(...)) -> dict:
     """Execute a SQL query against a workspace.
 

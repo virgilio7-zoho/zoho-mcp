@@ -548,6 +548,24 @@ async def mcp_invoke(
                 },
             }
 
+# Support trailing slash in the MCP endpoint. Some MCP clients may
+# invoke ``/mcp/`` instead of ``/mcp``. FastAPI treats these as
+# distinct paths for POST requests, so we register an alias that
+# delegates to the main ``mcp_invoke`` handler.
+@app.post("/mcp/")
+async def mcp_invoke_alias(
+    payload: Optional[dict] = Body(
+        default=None,
+        description=(
+            "JSON‑RPC request payload. See ``/mcp`` for details."
+        ),
+    ),
+    request: Request = None,
+):
+    # Delegate to the main mcp_invoke handler. We explicitly pass the
+    # payload and request so the logic remains the same.
+    return await mcp_invoke(payload=payload, request=request)
+
         # Tool execution
         if method == "tools/call":
             name = params.get("name")

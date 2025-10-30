@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import json
 import asyncio
+from datetime import datetime
 
 # Import the client helpers from the sibling module. Relative import avoids
 # requiring ``app`` to be installed as a top-level package.
@@ -51,6 +52,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------
+# Well-known endpoints for OpenID configuration and OAuth protected
+# resource discovery. ChatGPT's MCP client attempts to probe these
+# endpoints even when no authentication is configured. To prevent 404
+# errors in logs and potential failure, we provide minimal JSON
+# responses. In a production system these would expose actual
+# configuration details or return 404 as appropriate. Here we return
+# empty objects.
+
+@app.get("/.well-known/openid-configuration", include_in_schema=False)
+def well_known_openid_config() -> dict:
+    """Minimal OpenID configuration endpoint.
+
+    MCP clients may request this endpoint when negotiating OAuth
+    details. We return an empty configuration to signal that no
+    OpenID configuration is provided.
+    """
+    return {}
+
+
+@app.get("/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
+def well_known_openid_config_sub(subpath: str) -> dict:
+    """Catch-all for OpenID configuration subpaths."""
+    return {}
+
+
+@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
+def well_known_oauth_authorization_server() -> dict:
+    """Minimal OAuth authorization server discovery endpoint."""
+    return {}
+
+
+@app.get("/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
+def well_known_oauth_authorization_server_sub(subpath: str) -> dict:
+    """Catch-all for OAuth authorization server subpaths."""
+    return {}
+
+
+@app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
+def well_known_oauth_protected_resource() -> dict:
+    """Minimal OAuth protected resource discovery endpoint."""
+    return {}
+
+
+@app.get("/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
+def well_known_oauth_protected_resource_sub(subpath: str) -> dict:
+    """Catch-all for OAuth protected resource subpaths."""
+    return {}
 
 
 # ---------- Health ----------
@@ -461,17 +511,42 @@ async def mcp_invoke(
             return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": result}
 
         # Initialization handshake
-        # According to the MCP lifecycle, clients send an ``initialize``
-        # request to negotiate capabilities before using the server. We
-        # respond with minimal capabilities indicating that tools are
-        # supported and that the list does not change dynamically.
+        # Clients send an ``initialize`` request with a desired protocolVersion
+        # and (optionally) client capabilities. According to the MCP spec,
+        # servers should return the negotiated protocolVersion, declare their
+        # supported capabilities, and may include serverInfo. We reflect
+        # back the requested protocolVersion if provided, defaulting to
+        # today's date if absent.
         if method == "initialize":
+            requested_proto = None
+            # ``params`` may contain a ``protocolVersion`` requested by the client
+            # and a ``capabilities`` object. We ignore client capabilities for
+            # now and support only tools.
+            try:
+                requested_proto = params.get("protocolVersion")
+            except Exception:
+                requested_proto = None
+            # Use requested protocol version or current date as fallback
+            if requested_proto:
+                protocol_version = requested_proto
+            else:
+                protocol_version = datetime.utcnow().strftime("%Y-%m-%d")
             capabilities = {
                 "tools": {"listChanged": False},
-                "resources": {"listChanged": False},
-                "prompts": {"listChanged": False},
             }
-            return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": {"capabilities": capabilities}}
+            server_info = {
+                "name": "Zoho Analytics MCP",
+                "version": "0.1.0",
+            }
+            return {
+                "jsonrpc": "2.0",
+                "id": jsonrpc_id,
+                "result": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": capabilities,
+                    "serverInfo": server_info,
+                },
+            }
 
         # Tool execution
         if method == "tools/call":

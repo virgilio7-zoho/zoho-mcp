@@ -208,16 +208,13 @@ async def oauth_token(request: Request):
     redirect_uri = pick("redirect_uri", "")
     client_id    = pick("client_id", "")
     refresh_tok  = pick("refresh_token")
-    # --- Logging mínimo para depuración ---
-print({
-    "kind": "token_request",
-    "ctype": (request.headers.get("content-type") or "").lower(),
-    "grant_type": grant_type,
-    "has_code": bool(code),
-    "has_refresh": bool(refresh_tok),
-})
-    if grant_type not in ("authorization_code", "refresh_token"):
-        raise HTTPException(status_code=400, detail="unsupported_grant_type")
+   # --- Logging mínimo para depuración (una sola línea, sin riesgo de identación) ---
+print({"kind": "token_request", "ctype": ctype, "grant_type": grant_type,
+       "has_code": bool(code), "has_refresh": bool(refresh_tok)})
+
+if grant_type not in ("authorization_code", "refresh_token"):
+    raise HTTPException(status_code=400, detail="unsupported_grant_type")
+
 
     # ================= authorization_code =================
     if grant_type == "authorization_code":

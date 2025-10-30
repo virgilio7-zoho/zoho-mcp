@@ -43,7 +43,10 @@ API_KEY = os.getenv("API_KEY", "")
 # Almacén de tokens emitidos por nuestro "AS" mínimo (en memoria)
 # En producción podrías cambiarlos por Redis/DB. Aquí basta en memoria.
 _OAUTH_TOKENS: dict[str, float] = {}   # access_token -> exp_ts
-
+# authorization_code -> (exp_ts, client_id, redirect_uri)
+_OAUTH_CODES: dict[str, tuple[float, str, str]] = {}
+# refresh_token -> exp_ts
+_OAUTH_REFRESH: dict[str, float] = {}
 def _bearer_valid(auth_header: str | None) -> bool:
     if not auth_header or not auth_header.lower().startswith("bearer "):
         return False

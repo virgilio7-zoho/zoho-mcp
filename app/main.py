@@ -182,7 +182,7 @@ async def oauth_token(request: Request):
     ctype = (request.headers.get("content-type") or "").lower()
     data: dict = {}
 
-    # a) Intentar como form (PowerShell, curl, la mayoría de clientes OAuth)
+    # a) Intentar como form
     if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
         try:
             form = await request.form()
@@ -208,64 +208,63 @@ async def oauth_token(request: Request):
     redirect_uri = pick("redirect_uri", "")
     client_id    = pick("client_id", "")
     refresh_tok  = pick("refresh_token")
-   # --- Logging mínimo para depuración (una sola línea, sin riesgo de identación) ---
-print({"kind": "token_request", "ctype": ctype, "grant_type": grant_type,
-       "has_code": bool(code), "has_refresh": bool(refresh_tok)})
 
-if grant_type not in ("authorization_code", "refresh_token"):
-    raise HTTPException(status_code=400, detail="unsupported_grant_type")
+    # Logging mínimo (una línea)
+    print({"kind": "token_request", "ctype": ctype, "grant_type": grant_type,
+           "has_code": bool(code), "has_refresh": bool(refresh_tok)})
 
-   # ================= authorization_code =================
-if grant_type == "authorization_code":
-    if not code:
-        raise HTTPException(status_code=400, detail="invalid_request")
+    if grant_type not in ("authorization_code", "refresh_token"):
+        raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
-    # Buscar el code emitido en /authorize
-    data_tuple = _OAUTH_CODES.pop(code, None)
-    if not data_tuple:
-        raise HTTPException(status_code=400, detail="invalid_grant")
+    # ================= authorization_code =================
+    if grant_type == "authorization_code":
+        if not code:
+            raise HTTPException(status_code=400, detail="invalid_request")
 
-    exp_ts, expected_client, expected_redirect = data_tuple
-    if exp_ts < time.time():
-        raise HTTPException(status_code=400, detail="invalid_grant")
+        # Buscar el code emitido en /authorize
+        data_tuple = _OAUTH_CODES.pop(code, None)
+        if not data_tuple:
+            raise HTTPException(status_code=400, detail="invalid_grant")
 
-    # (Opcional) validar client_id/redirect_uri
-    # if expected_client and client_id and client_id != expected_client: ...
-    # if expected_redirect and redirect_uri and redirect_uri != expected_redirect: ...
+        exp_ts, expected_client, expected_redirect = data_tuple
+        if exp_ts < time.time():
+            raise HTTPException(status_code=400, detail="invalid_grant")
 
-    access_token  = secrets.token_urlsafe(32)
-    refresh_token = secrets.token_urlsafe(32)
+        # (Opcional) validar client_id/redirect_uri aquí…
 
-    _OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
-    _OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
+        access_token  = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
 
-    return {
-        "token_type": "Bearer",
-        "access_token": access_token,
-        "expires_in": ACCESS_TTL_SECONDS,
-        "refresh_token": refresh_token,
-        "scope": "default",
-    }
+        _OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
+        _OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
 
-# ================= refresh_token =================
-elif grant_type == "refresh_token":
-    if not refresh_tok:
-        raise HTTPException(status_code=400, detail="invalid_request")
+        return {
+            "token_type": "Bearer",
+            "access_token": access_token,
+            "expires_in": ACCESS_TTL_SECONDS,
+            "refresh_token": refresh_token,
+            "scope": "default",
+        }
 
-    exp = _OAUTH_REFRESH.get(refresh_tok)
-    if not exp or exp < time.time():
-        raise HTTPException(status_code=400, detail="invalid_grant")
+    # ================= refresh_token =================
+    elif grant_type == "refresh_token":
+        if not refresh_tok:
+            raise HTTPException(status_code=400, detail="invalid_request")
 
-    access_token = secrets.token_urlsafe(32)
-    _OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
+        exp = _OAUTH_REFRESH.get(refresh_tok)
+        if not exp or exp < time.time():
+            raise HTTPException(status_code=400, detail="invalid_grant")
 
-    return {
-        "token_type": "Bearer",
-        "access_token": access_token,
-        "expires_in": ACCESS_TTL_SECONDS,
-        "refresh_token": refresh_tok,  # mismo refresh de larga duración
-        "scope": "default",
-    }
+        access_token = secrets.token_urlsafe(32)
+        _OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
+
+        return {
+            "token_type": "Bearer",
+            "access_token": access_token,
+            "expires_in": ACCESS_TTL_SECONDS,
+            "refresh_token": refresh_tok,  # mantenemos el mismo refresh
+            "scope": "default",
+        }
 
 # ---------- Health ----------
 @app.get("/health")

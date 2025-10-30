@@ -20,7 +20,7 @@ starting this server; otherwise the client will raise runtime errors.
 See ``config.py`` for the list of variables and their descriptions.
 """
 
-import os
+import os, secrets, time
 from fastapi import FastAPI, Query, Body, Request, Header, Depends, HTTPException
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,17 +41,33 @@ from .zoho_client import (
     export_view,
     query_data,
 )
-# --- API Key simple (protege los endpoints de datos) ---
+# ========= AUTH LIGERA: API KEY o BEARER emitido por este servidor =========
 API_KEY = os.getenv("API_KEY", "")
+# Almacén de tokens emitidos por nuestro "AS" mínimo (en memoria)
+# En producción podrías cambiarlos por Redis/DB. Aquí basta en memoria.
+_OAUTH_TOKENS: dict[str, float] = {}   # access_token -> exp_ts
 
-def require_key(x_api_key: str | None = Header(None)):
-    """
-    Verifica que el cliente envía X-API-Key válida.
-    Configura API_KEY como variable de entorno en Render.
-    """
-    if not API_KEY or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+def _bearer_valid(auth_header: str | None) -> bool:
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header.split(" ", 1)[1].strip()
+    exp = _OAUTH_TOKENS.get(token)
+    return bool(exp and exp > time.time())
 
+def require_key_or_bearer(
+    x_api_key: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    """
+    Permite EITHER:
+      - X-API-Key (nuestra clave fija); o
+      - Authorization: Bearer <access_token> emitido por este mismo servidor.
+    """
+    if API_KEY and x_api_key == API_KEY:
+        return
+    if _bearer_valid(authorization):
+        return
+    raise HTTPException(status_code=401, detail="Auth required: X-API-Key or Bearer token")
 
 app = FastAPI(title="Zoho Analytics MCP (v2) — Tools oficiales")
 
@@ -63,95 +79,74 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------------------------------------------------------------
-# Well-known endpoints for OpenID configuration and OAuth protected
-# resource discovery. ChatGPT's MCP client attempts to probe these
-# endpoints even when no authentication is configured. To prevent 404
-# errors in logs and potential failure, we provide minimal JSON
-# responses. In a production system these would expose actual
-# configuration details or return 404 as appropriate. Here we return
-# empty objects.
-
-@app.get("/.well-known/openid-configuration", include_in_schema=False)
-def well_known_openid_config() -> dict:
-    """Minimal OpenID configuration endpoint.
-
-    MCP clients may request this endpoint when negotiating OAuth
-    details. We return an empty configuration to signal that no
-    OpenID configuration is provided.
-    """
-    return {}
-
-
-@app.get("/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
-def well_known_openid_config_sub(subpath: str) -> dict:
-    """Catch-all for OpenID configuration subpaths."""
-    return {}
-
-
-@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
-def well_known_oauth_authorization_server() -> dict:
-    """Minimal OAuth authorization server discovery endpoint."""
-    return {}
-
-
-@app.get("/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
-def well_known_oauth_authorization_server_sub(subpath: str) -> dict:
-    """Catch-all for OAuth authorization server subpaths."""
-    return {}
-
+# ======================= OAUTH MÍNIMO (para el conector) =======================
+ISSUER = lambda req: f"{req.url.scheme}://{req.url.netloc}"
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
-def well_known_oauth_protected_resource() -> dict:
-    """Minimal OAuth protected resource discovery endpoint."""
-    return {}
+def oauth_protected_resource(req: Request):
+    """Metadata del recurso protegido: indica qué Authorization Server usar."""
+    return {
+        "issuer": ISSUER(req),
+        "authorization_servers": [ISSUER(req)]
+    }
 
+@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
+def oauth_authorization_server(req: Request):
+    """Metadata del Authorization Server (AS) súper-mínimo."""
+    base = ISSUER(req)
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "grant_types_supported": ["authorization_code"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "scopes_supported": ["default"],
+    }
 
-@app.get("/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
-def well_known_oauth_protected_resource_sub(subpath: str) -> dict:
-    """Catch-all for OAuth protected resource subpaths."""
-    return {}
+@app.get("/authorize", include_in_schema=False)
+def oauth_authorize(
+    req: Request,
+    response_type: str = Query(...),  # "code"
+    client_id: str = Query(...),
+    redirect_uri: str = Query(...),
+    scope: str = Query("default"),
+    state: str = Query(""),
+    code_challenge: str | None = Query(None),
+    code_challenge_method: str | None = Query(None),
+):
+    """Otorga consentimiento inmediato y redirige con `code`."""
+    from starlette.responses import RedirectResponse
+    code = secrets.token_urlsafe(24)
+    exp = time.time() + 60
+    _OAUTH_TOKENS[f"code:{code}"] = exp
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(url=f"{redirect_uri}{sep}code={code}&state={state}")
 
-#---------------------------------------------------------------------
-# Well-known endpoints under the /mcp prefix
-#
-# Some MCP clients (including ChatGPT) incorrectly request well-known
-# discovery documents under the /mcp prefix. FastAPI treats paths
-# literally, so these requests would otherwise return 404. We mirror
-# the top-level /.well-known routes under /mcp/.well-known to avoid
-# these errors. The handlers return the same minimal JSON objects as
-# their top-level counterparts.
+@app.post("/token", include_in_schema=False)
+async def oauth_token(
+    grant_type: str = Body(..., embed=True),
+    code: str = Body(..., embed=True),
+    redirect_uri: str = Body(..., embed=True),
+    client_id: str = Body(..., embed=True),
+    code_verifier: str | None = Body(None, embed=True),
+):
+    """Canjea `code` por access_token."""
+    exp = _OAUTH_TOKENS.pop(f"code:{code}", None)
+    if not exp or exp < time.time():
+        raise HTTPException(status_code=400, detail="invalid_grant")
 
-@app.get("/mcp/.well-known/openid-configuration", include_in_schema=False)
-def mcp_well_known_openid_config() -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
-def mcp_well_known_openid_config_sub(subpath: str) -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/oauth-authorization-server", include_in_schema=False)
-def mcp_well_known_oauth_authorization_server() -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
-def mcp_well_known_oauth_authorization_server_sub(subpath: str) -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/oauth-protected-resource", include_in_schema=False)
-def mcp_well_known_oauth_protected_resource() -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
-def mcp_well_known_oauth_protected_resource_sub(subpath: str) -> dict:
-    return {}
-
+    access_token = secrets.token_urlsafe(32)
+    _OAUTH_TOKENS[access_token] = time.time() + 3600  # 1h
+    refresh_token = secrets.token_urlsafe(32)
+    return {
+        "token_type": "Bearer",
+        "access_token": access_token,
+        "expires_in": 3600,
+        "refresh_token": refresh_token,
+        "scope": "default",
+    }
+# ============================================================================== 
 
 # ---------- Health ----------
 @app.get("/health")
@@ -166,7 +161,7 @@ def health() -> dict:
 
 
 # ---------- get_workspaces_list ----------
-@app.get("/workspaces_v2", dependencies=[Depends(require_key)])
+@app.get("/workspaces_v2", dependencies=[Depends(require_key_or_bearer)])
 def workspaces_v2() -> dict:
     """List all workspaces available to the authenticated user.
 
@@ -179,7 +174,7 @@ def workspaces_v2() -> dict:
 
 
 # ---------- search_views ----------
-@app.get("/views_v2", dependencies=[Depends(require_key)])
+@app.get("/views_v2", dependencies=[Depends(require_key_or_bearer)])
 def views_v2(
     workspace_id: str = Query(..., description="Workspace ID"),
     q: str | None = Query(None, description="Texto a buscar"),
@@ -211,7 +206,7 @@ def views_v2(
 
 
 # ---------- get_view_details ----------
-@app.get("/view_details_v2", dependencies=[Depends(require_key)])
+@app.get("/view_details_v2", dependencies=[Depends(require_key_or_bearer)])
 def view_details_v2(
     workspace_id: str = Query(
         ...,
@@ -253,7 +248,7 @@ class ExportViewBody(BaseModel):
     offset: int = Field(0, ge=0)
 
 
-@app.post("/export_view_v2", dependencies=[Depends(require_key)])
+@app.post("/export_view_v2", dependencies=[Depends(require_key_or_bearer)])
 def export_view_v2(payload: ExportViewBody = Body(...)) -> dict:
     """Export data from a specific view.
 
@@ -275,7 +270,7 @@ class QueryBody(BaseModel):
     sql: str = Field(..., description="Consulta SQL")
 
 
-@app.post("/query_v2", dependencies=[Depends(require_key)])
+@app.post("/query_v2", dependencies=[Depends(require_key_or_bearer)])
 def query_v2(payload: QueryBody = Body(...)) -> dict:
     """Execute a SQL query against a workspace.
 

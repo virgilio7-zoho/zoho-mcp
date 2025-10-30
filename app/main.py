@@ -1,5 +1,3 @@
- para el punto de agregar los endpoint 0auth, ya hay configuraciones en el archivo. por fa revisa todo y dame las partes donde deba cambiar o borrar el codigo.
-
 """
 Main entry point for the Zoho Analytics MCP server.
 
@@ -22,15 +20,12 @@ starting this server; otherwise the client will raise runtime errors.
 See ``config.py`` for the list of variables and their descriptions.
 """
 
-import os, secrets, time
-from fastapi import FastAPI, Query, Body, Request, Header, Depends, HTTPException
+import os, secrets, time, json, asyncio
+from fastapi import FastAPI, Query, Body, Request, Header, Depends, HTTPException, Form
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-
-import json
-import asyncio
 from datetime import datetime
 
 # Import the client helpers from the sibling module. Relative import avoids
@@ -82,94 +77,157 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------
-# Well-known endpoints for OpenID configuration and OAuth protected
-# resource discovery. ChatGPT's MCP client attempts to probe these
-# endpoints even when no authentication is configured. To prevent 404
-# errors in logs and potential failure, we provide minimal JSON
-# responses. In a production system these would expose actual
-# configuration details or return 404 as appropriate. Here we return
-# empty objects.
-
-@app.get("/.well-known/openid-configuration", include_in_schema=False)
-def well_known_openid_config() -> dict:
-    """Minimal OpenID configuration endpoint.
-
-    MCP clients may request this endpoint when negotiating OAuth
-    details. We return an empty configuration to signal that no
-    OpenID configuration is provided.
-    """
-    return {}
-
-
-@app.get("/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
-def well_known_openid_config_sub(subpath: str) -> dict:
-    """Catch-all for OpenID configuration subpaths."""
-    return {}
-
-
-@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
-def well_known_oauth_authorization_server() -> dict:
-    """Minimal OAuth authorization server discovery endpoint."""
-    return {}
-
-
-@app.get("/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
-def well_known_oauth_authorization_server_sub(subpath: str) -> dict:
-    """Catch-all for OAuth authorization server subpaths."""
-    return {}
-
+# ======================= OAUTH MÍNIMO (para el conector) =======================
+def _issuer(req: Request) -> str:
+    return f"{req.url.scheme}://{req.url.netloc}"
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
-def well_known_oauth_protected_resource() -> dict:
-    """Minimal OAuth protected resource discovery endpoint."""
-    return {}
+def oauth_protected_resource(req: Request):
+    """Indica qué Authorization Server usar."""
+    base = _issuer(req)
+    return {
+        "issuer": base,
+        "authorization_servers": [base],
+    }
 
+@app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
+def oauth_authorization_server(req: Request):
+    """Metadata del Authorization Server (AS)."""
+    base = _issuer(req)
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "scopes_supported": ["default"],
+    }
 
-@app.get("/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
-def well_known_oauth_protected_resource_sub(subpath: str) -> dict:
-    """Catch-all for OAuth protected resource subpaths."""
-    return {}
+@app.get("/.well-known/openid-configuration", include_in_schema=False)
+def openid_configuration(req: Request):
+    """Algunos clientes consultan también esta ruta; devolvemos lo mismo."""
+    base = _issuer(req)
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "scopes_supported": ["default"],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+    }
 
-#---------------------------------------------------------------------
-# Well-known endpoints under the /mcp prefix
-#
-# Some MCP clients (including ChatGPT) incorrectly request well-known
-# discovery documents under the /mcp prefix. FastAPI treats paths
-# literally, so these requests would otherwise return 404. We mirror
-# the top-level /.well-known routes under /mcp/.well-known to avoid
-# these errors. The handlers return the same minimal JSON objects as
-# their top-level counterparts.
+@app.get("/authorize", include_in_schema=False)
+def oauth_authorize(
+    req: Request,
+    response_type: str = Query(...),           # "code"
+    client_id: str = Query(...),               # e.g., "chatgpt"
+    redirect_uri: str = Query(...),
+    scope: str = Query("default"),
+    state: str = Query(""),
+    code_challenge: str | None = Query(None),          # tolerante
+    code_challenge_method: str | None = Query(None),   # "S256" | "plain"
+):
+    """Consent inmediato y redirección con `code`."""
+    if response_type != "code":
+        raise HTTPException(status_code=400, detail="unsupported_response_type")
 
-@app.get("/mcp/.well-known/openid-configuration", include_in_schema=False)
-def mcp_well_known_openid_config() -> dict:
-    return {}
+    code = secrets.token_urlsafe(24)
+    # Guardamos por 2 minutos el code (client_id y redirect solo informativos)
+    from typing import Tuple
+    global _OAUTH_CODES
+    _OAUTH_CODES[code] = (time.time() + 120, client_id, redirect_uri)  # type: ignore
 
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(url=f"{redirect_uri}{sep}code={code}&state={state}")
 
-@app.get("/mcp/.well-known/openid-configuration/{subpath:path}", include_in_schema=False)
-def mcp_well_known_openid_config_sub(subpath: str) -> dict:
-    return {}
+def _body_value(body: dict, name: str, default=None):
+    """Lee un valor del body admitiendo JSON o form y listas."""
+    if name in body:
+        v = body[name]
+        if isinstance(v, list) and v:
+            return v[0]
+        return v
+    return default
 
+@app.post("/token", include_in_schema=False)
+async def oauth_token(
+    request: Request,
+    # JSON (opcionales)
+    grant_type_json: Optional[str] = Body(None, embed=True),
+    code_json: Optional[str] = Body(None, embed=True),
+    redirect_uri_json: Optional[str] = Body(None, embed=True),
+    client_id_json: Optional[str] = Body(None, embed=True),
+    refresh_token_json: Optional[str] = Body(None, embed=True),
+    code_verifier_json: Optional[str] = Body(None, embed=True),
+    # FORM (opcionales)
+    grant_type_form: Optional[str] = Form(None),
+    code_form: Optional[str] = Form(None),
+    redirect_uri_form: Optional[str] = Form(None),
+    client_id_form: Optional[str] = Form(None),
+    refresh_token_form: Optional[str] = Form(None),
+    code_verifier_form: Optional[str] = Form(None),
+):
+    """Canjea authorization_code por access_token o refresh_token por uno nuevo."""
+    if request.headers.get("content-type","").startswith("application/json"):
+        body = {
+            "grant_type": grant_type_json, "code": code_json,
+            "redirect_uri": redirect_uri_json, "client_id": client_id_json,
+            "refresh_token": refresh_token_json, "code_verifier": code_verifier_json,
+        }
+    else:
+        body = {
+            "grant_type": grant_type_form, "code": code_form,
+            "redirect_uri": redirect_uri_form, "client_id": client_id_form,
+            "refresh_token": refresh_token_form, "code_verifier": code_verifier_form,
+        }
 
-@app.get("/mcp/.well-known/oauth-authorization-server", include_in_schema=False)
-def mcp_well_known_oauth_authorization_server() -> dict:
-    return {}
+    grant_type = _body_value(body, "grant_type")
+    if grant_type not in ("authorization_code", "refresh_token"):
+        raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
+    if grant_type == "authorization_code":
+        code = _body_value(body, "code")
+        if not code:
+            raise HTTPException(status_code=400, detail="invalid_request")
+        data = _OAUTH_CODES.pop(code, None)
+        if not data:
+            raise HTTPException(status_code=400, detail="invalid_grant")
+        exp_ts, _client, _redir = data
+        if exp_ts < time.time():
+            raise HTTPException(status_code=400, detail="invalid_grant")
 
-@app.get("/mcp/.well-known/oauth-authorization-server/{subpath:path}", include_in_schema=False)
-def mcp_well_known_oauth_authorization_server_sub(subpath: str) -> dict:
-    return {}
+        access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+        _OAUTH_TOKENS[access_token] = time.time() + 3600        # 1h
+        _OAUTH_REFRESH[refresh_token] = time.time() + 30*24*3600 # 30 días
+        return {
+            "token_type": "Bearer",
+            "access_token": access_token,
+            "expires_in": 3600,
+            "refresh_token": refresh_token,
+            "scope": "default",
+        }
 
+    # refresh_token
+    refresh_token = _body_value(body, "refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="invalid_request")
+    exp = _OAUTH_REFRESH.get(refresh_token)
+    if not exp or exp < time.time():
+        raise HTTPException(status_code=400, detail="invalid_grant")
 
-@app.get("/mcp/.well-known/oauth-protected-resource", include_in_schema=False)
-def mcp_well_known_oauth_protected_resource() -> dict:
-    return {}
-
-
-@app.get("/mcp/.well-known/oauth-protected-resource/{subpath:path}", include_in_schema=False)
-def mcp_well_known_oauth_protected_resource_sub(subpath: str) -> dict:
-    return {}
-
+    access_token = secrets.token_urlsafe(32)
+    _OAUTH_TOKENS[access_token] = time.time() + 3600
+    return {
+        "token_type": "Bearer",
+        "access_token": access_token,
+        "expires_in": 3600,
+        "refresh_token": refresh_token,
+        "scope": "default",
+    }
+# ============================================================================== 
 
 # ---------- Health ----------
 @app.get("/health")

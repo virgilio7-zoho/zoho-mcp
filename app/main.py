@@ -97,7 +97,6 @@ def _issuer(req: Request) -> str:
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
 def oauth_protected_resource(req: Request):
-    """Indica qué Authorization Server usar."""
     base = _issuer(req)
     return {
         "issuer": base,
@@ -106,7 +105,6 @@ def oauth_protected_resource(req: Request):
 
 @app.get("/.well-known/oauth-authorization-server", include_in_schema=False)
 def oauth_authorization_server(req: Request):
-    """Metadata del Authorization Server (AS)."""
     base = _issuer(req)
     return {
         "issuer": base,
@@ -114,23 +112,27 @@ def oauth_authorization_server(req: Request):
         "token_endpoint": f"{base}/token",
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "scopes_supported": ["default", "offline_access"],
         "code_challenge_methods_supported": ["S256", "plain"],
-        "scopes_supported": ["default"],
+        "token_endpoint_auth_methods_supported": ["none"],   # <- clave para este flujo
     }
 
 @app.get("/.well-known/openid-configuration", include_in_schema=False)
 def openid_configuration(req: Request):
-    """Algunos clientes consultan también esta ruta; devolvemos lo mismo."""
     base = _issuer(req)
     return {
         "issuer": base,
         "authorization_endpoint": f"{base}/authorize",
         "token_endpoint": f"{base}/token",
-        "scopes_supported": ["default"],
-        "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "scopes_supported": ["default", "offline_access"],
         "code_challenge_methods_supported": ["S256", "plain"],
+        "token_endpoint_auth_methods_supported": ["none"],
     }
+
 
 @app.get("/authorize", include_in_schema=False)
 def oauth_authorize(
@@ -153,8 +155,13 @@ def oauth_authorize(
     global _OAUTH_CODES
     _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)  # type: ignore
 
-    sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(url=f"{redirect_uri}{sep}code={code}&state={state}")
+    # construir la URL final con code y state
+sep = "&" if "?" in redirect_uri else "?"
+final_url = f"{redirect_uri}{sep}code={code}&state={state}"
+
+# IMPORTANTE: usar 302 (no 307)
+return RedirectResponse(url=final_url, status_code=302)
+
 
 def _body_value(body: dict, name: str, default=None):
     """Lee un valor del body admitiendo JSON o form y listas."""
@@ -201,7 +208,14 @@ async def oauth_token(request: Request):
     redirect_uri = pick("redirect_uri", "")
     client_id    = pick("client_id", "")
     refresh_tok  = pick("refresh_token")
-
+    # --- Logging mínimo para depuración ---
+print({
+    "kind": "token_request",
+    "ctype": (request.headers.get("content-type") or "").lower(),
+    "grant_type": grant_type,
+    "has_code": bool(code),
+    "has_refresh": bool(refresh_tok),
+})
     if grant_type not in ("authorization_code", "refresh_token"):
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 

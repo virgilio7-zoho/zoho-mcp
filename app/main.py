@@ -136,12 +136,12 @@ def openid_configuration(req: Request):
 
 @app.get("/authorize", include_in_schema=False)
 def oauth_authorize(
-    req: Request,
+    request: Request,
     response_type: str = Query(...),           # "code"
-    client_id: str = Query(...),               # e.g., "chatgpt"
+    client_id: str = Query(...),               # p.ej., "chatgpt"
     redirect_uri: str = Query(...),
-    scope: str = Query("default"),
-    state: str = Query(""),
+    scope: str | None = Query(None),
+    state: str | None = Query(None),
     code_challenge: str | None = Query(None),          # tolerante
     code_challenge_method: str | None = Query(None),   # "S256" | "plain"
 ):
@@ -149,18 +149,18 @@ def oauth_authorize(
     if response_type != "code":
         raise HTTPException(status_code=400, detail="unsupported_response_type")
 
+    # Emitir authorization_code y guardarlo por 10 minutos
     code = secrets.token_urlsafe(24)
-    # Guardamos por 2 minutos el code (client_id y redirect solo informativos)
-    from typing import Tuple
-    global _OAUTH_CODES
-    _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)  # type: ignore
+    _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)
 
-    # construir la URL final con code y state
-sep = "&" if "?" in redirect_uri else "?"
-final_url = f"{redirect_uri}{sep}code={code}&state={state}"
+    # Construir la URL final con ?code= y state (si viene)
+    sep = "&" if "?" in redirect_uri else "?"
+    final_url = f"{redirect_uri}{sep}code={code}"
+    if state:
+        final_url += f"&state={state}"
 
-# IMPORTANTE: usar 302 (no 307)
-return RedirectResponse(url=final_url, status_code=302)
+    # IMPORTANTE: redirigir con 302 (no 307)
+    return RedirectResponse(url=final_url, status_code=302)
 
 
 def _body_value(body: dict, name: str, default=None):

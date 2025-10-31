@@ -795,146 +795,155 @@ async def mcp_invoke(
                 "id": jsonrpc_id,
                 "result": result,
             }
-# ========= MEJORA: Manejo de errores en tools/call =========
 
-# Reemplazar el bloque try/except dentro de tools/call con este código más robusto:
-        if method == "tools/call":
-    name = params.get("name")
-    arguments = params.get("arguments", {}) or {}
-    
-    print(f"[MCP] Tool call: {name} with args: {list(arguments.keys())}")
-    
-    try:
-        # Dispatch según el tool
-        if name == "workspaces_v2":
-            result_data = get_workspaces_list()
-            
-        elif name == "views_v2":
-            workspace_id = arguments.get("workspace_id")
-            if not workspace_id:
-                raise ValueError("Missing required parameter: workspace_id")
-            result_data = search_views(
-                workspace_id,
-                arguments.get("q"),
-                int(arguments.get("limit", 200)),
-                int(arguments.get("offset", 0)),
-            )
-            
-        elif name == "view_details_v2":
-            workspace_id = arguments.get("workspace_id")
-            view_id = arguments.get("view_id")
-            if not (workspace_id and view_id):
-                raise ValueError("Missing required parameters: workspace_id and view_id")
-            result_data = get_view_details(workspace_id, view_id)
-            
-        elif name == "export_view_v2":
-            workspace_id = arguments.get("workspace_id")
-            view = arguments.get("view")
-            if not (workspace_id and view):
-                raise ValueError("Missing required parameters: workspace_id and view")
-            limit = int(arguments.get("limit", 100))
-            offset = int(arguments.get("offset", 0))
-            result_data = export_view(workspace_id, view, limit, offset)
-            
-        elif name == "query_v2":
-            workspace_id = arguments.get("workspace_id")
-            sql = arguments.get("sql")
-            if not (workspace_id and sql):
-                raise ValueError("Missing required parameters: workspace_id and sql")
-            result_data = query_data(workspace_id, sql)
-            
-        else:
-            print(f"[MCP] Unknown tool: {name}")
+        # === TOOLS/LIST ===
+        if method == "tools/list":
+            result = {"tools": TOOL_DEFINITIONS}
+            print(f"[MCP] Returning {len(TOOL_DEFINITIONS)} tools")
             return {
                 "jsonrpc": "2.0",
                 "id": jsonrpc_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Unknown tool: {name}"
-                }
+                "result": result
             }
 
-        # Retornar según spec MCP
-        print(f"[MCP] Tool {name} executed successfully")
-        return {
-            "jsonrpc": "2.0",
-            "id": jsonrpc_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",  # ⚠️ Cambiado de "json" a "text"
-                        "text": json.dumps(result_data, indent=2, ensure_ascii=False)
+        # === TOOLS/CALL ===
+        if method == "tools/call":
+            name = params.get("name")
+            arguments = params.get("arguments", {}) or {}
+            
+            print(f"[MCP] Tool call: {name} with args: {list(arguments.keys())}")
+            
+            try:
+                # Dispatch según el tool
+                if name == "workspaces_v2":
+                    result_data = get_workspaces_list()
+                    
+                elif name == "views_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    if not workspace_id:
+                        raise ValueError("Missing required parameter: workspace_id")
+                    result_data = search_views(
+                        workspace_id,
+                        arguments.get("q"),
+                        int(arguments.get("limit", 200)),
+                        int(arguments.get("offset", 0)),
+                    )
+                    
+                elif name == "view_details_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    view_id = arguments.get("view_id")
+                    if not (workspace_id and view_id):
+                        raise ValueError("Missing required parameters: workspace_id and view_id")
+                    result_data = get_view_details(workspace_id, view_id)
+                    
+                elif name == "export_view_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    view = arguments.get("view")
+                    if not (workspace_id and view):
+                        raise ValueError("Missing required parameters: workspace_id and view")
+                    limit = int(arguments.get("limit", 100))
+                    offset = int(arguments.get("offset", 0))
+                    result_data = export_view(workspace_id, view, limit, offset)
+                    
+                elif name == "query_v2":
+                    workspace_id = arguments.get("workspace_id")
+                    sql = arguments.get("sql")
+                    if not (workspace_id and sql):
+                        raise ValueError("Missing required parameters: workspace_id and sql")
+                    result_data = query_data(workspace_id, sql)
+                    
+                else:
+                    print(f"[MCP] Unknown tool: {name}")
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": jsonrpc_id,
+                        "error": {
+                            "code": -32601,
+                            "message": f"Unknown tool: {name}"
+                        }
                     }
-                ],
-                "isError": False
-            },
-        }
-        
-    except RuntimeError as exc:
-        # Errores de configuración o credenciales
-        error_msg = str(exc)
-        print(f"[MCP] RuntimeError in {name}: {error_msg}")
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": jsonrpc_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Configuration Error: {error_msg}\n\n"
-                                f"Please check that all required environment variables are set:\n"
-                                f"- ANALYTICS_CLIENT_ID\n"
-                                f"- ANALYTICS_CLIENT_SECRET\n"
-                                f"- ANALYTICS_REFRESH_TOKEN\n"
-                                f"- ANALYTICS_ORG_ID"
+
+                # Retornar según spec MCP
+                print(f"[MCP] Tool {name} executed successfully")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(result_data, indent=2, ensure_ascii=False)
+                            }
+                        ],
+                        "isError": False
+                    },
+                }
+                
+            except RuntimeError as exc:
+                # Errores de configuración o credenciales
+                error_msg = str(exc)
+                print(f"[MCP] RuntimeError in {name}: {error_msg}")
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Configuration Error: {error_msg}\n\n"
+                                        f"Please check that all required environment variables are set:\n"
+                                        f"- ANALYTICS_CLIENT_ID\n"
+                                        f"- ANALYTICS_CLIENT_SECRET\n"
+                                        f"- ANALYTICS_REFRESH_TOKEN\n"
+                                        f"- ANALYTICS_ORG_ID"
+                            }
+                        ],
+                        "isError": True
                     }
-                ],
-                "isError": True
-            }
-        }
-        
-    except ValueError as exc:
-        # Errores de validación de parámetros
-        error_msg = str(exc)
-        print(f"[MCP] ValueError in {name}: {error_msg}")
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": jsonrpc_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Validation Error: {error_msg}"
+                }
+                
+            except ValueError as exc:
+                # Errores de validación de parámetros
+                error_msg = str(exc)
+                print(f"[MCP] ValueError in {name}: {error_msg}")
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Validation Error: {error_msg}"
+                            }
+                        ],
+                        "isError": True
                     }
-                ],
-                "isError": True
-            }
-        }
-        
-    except Exception as exc:
-        # Cualquier otro error
-        import traceback
-        error_msg = str(exc)
-        error_trace = traceback.format_exc()
-        print(f"[MCP] Unexpected error in {name}: {error_msg}")
-        print(f"[MCP] Traceback:\n{error_trace}")
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": jsonrpc_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Error executing {name}: {error_msg}\n\n"
-                                f"Check server logs for details."
+                }
+                
+            except Exception as exc:
+                # Cualquier otro error
+                import traceback
+                error_msg = str(exc)
+                error_trace = traceback.format_exc()
+                print(f"[MCP] Unexpected error in {name}: {error_msg}")
+                print(f"[MCP] Traceback:\n{error_trace}")
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": jsonrpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Error executing {name}: {error_msg}\n\n"
+                                        f"Check server logs for details."
+                            }
+                        ],
+                        "isError": True
                     }
-                ],
-                "isError": True
-            }
-        }
+                }
 
         # Método desconocido
         print(f"[MCP] Unknown method: {method}")
@@ -1018,7 +1027,7 @@ async def mcp_invoke(
         }
     )
 
-# El endpoint /mcp/ (con trailing slash) puede permanecer como alias
+
 @app.post("/mcp/")
 async def mcp_invoke_alias(
     payload: Optional[dict] = Body(default=None),

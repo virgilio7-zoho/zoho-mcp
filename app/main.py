@@ -258,6 +258,16 @@ async def oauth_token(request: Request):
             "refresh_token": refresh_tok,
             "scope": "default",
         }
+@app.get("/", include_in_schema=False)
+def root():
+    """
+    Raíz para verificación de disponibilidad (ChatGPT requiere /).
+    """
+    return {
+        "status": "ok",
+        "message": "Zoho Analytics MCP server online",
+        "endpoints": ["/health", "/authorize", "/token"]
+    }
 
 # ---------- Health ----------
 @app.get("/health")

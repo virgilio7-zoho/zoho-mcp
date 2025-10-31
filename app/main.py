@@ -332,16 +332,38 @@ def debug_oauth_state():
         "active_refresh": len(_OAUTH_REFRESH),
         "issuer_example": "Use _issuer() with a Request object"
     }
+# ========= CORRECCIÓN: Agregar POST / como endpoint MCP =========
+
+# REEMPLAZAR el endpoint GET / existente con este:
+
 @app.get("/", include_in_schema=False)
 def root():
     """
-    Raíz para verificación de disponibilidad (ChatGPT requiere /).
+    Raíz GET para verificación de disponibilidad.
     """
     return {
         "status": "ok",
         "message": "Zoho Analytics MCP server online",
-        "endpoints": ["/health", "/authorize", "/token"]
+        "endpoints": ["/health", "/authorize", "/token", "/mcp"],
+        "mcp_endpoint": "/mcp",
+        "protocol": "MCP",
     }
+
+
+# AGREGAR ESTE NUEVO ENDPOINT POST /:
+@app.post("/", include_in_schema=False)
+async def root_mcp(
+    payload: Optional[dict] = Body(default=None),
+    request: Request = None,
+):
+    """
+    POST / - Alias del endpoint /mcp para compatibilidad con clientes MCP.
+    Algunos clientes MCP (como ChatGPT) envían las solicitudes JSON-RPC a la raíz.
+    """
+    # Delegar directamente a mcp_invoke
+    return await mcp_invoke(payload=payload, request=request)
+
+
 
 # ---------- Health ----------
 @app.get("/health")
@@ -696,37 +718,20 @@ TOOL_DEFINITIONS: list[dict] = [
 # send JSON‑RPC requests to discover and invoke tools. This handler
 # inspects the incoming payload to determine which protocol is being used
 # and returns the appropriate response format.
+# El resto del código permanece igual, pero asegúrate de que
+# el endpoint /mcp también tenga el decorator correcto:
+
 @app.post("/mcp")
 async def mcp_invoke(
-    payload: Optional[dict] = Body(
-        default=None,
-        description=(
-            "JSON‑RPC request payload. For MCP clients this should contain a "
-            "`jsonrpc` version, a `method` such as `initialize`, `tools/list` "
-            "or `tools/call`, an `id`, and optionally `params`."
-        ),
-    ),
+    payload: Optional[dict] = Body(default=None),
     request: Request = None,
 ):
     """
     Invoke MCP methods or execute simple actions.
-
-    This endpoint accepts both JSON‑RPC 2.0 messages (used by ChatGPT and other
-    MCP clients) and a simplified `{action, input}` format for backward
-    compatibility. When invoked via Swagger/OpenAPI, provide a JSON‑RPC object
-    in the request body to test tool discovery and execution. For example:
-
-    ```
-    {
-      "jsonrpc": "2.0",
-      "id": 1,
-      "method": "initialize",
-      "params": {}
-    }
-    ```
+    
+    Acepta JSON-RPC 2.0 para tools/list, initialize, tools/call, etc.
     """
-    # Determine the incoming data. If `payload` is provided by FastAPI's body
-    # parser, use it; otherwise fall back to reading the raw request body.
+    # Determinar los datos entrantes
     if payload is not None:
         data = payload
     else:
@@ -736,41 +741,39 @@ async def mcp_invoke(
                 data = {}
             else:
                 data = json.loads(body_bytes.decode())
-        except Exception:
-            return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
+        except Exception as e:
+            print(f"[MCP] Parse error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"}
+                }
+            )
 
-    # --- JSON‑RPC 2.0 handling ---
+    # Log de debugging
+    method = data.get("method", "unknown")
+    print(f"[MCP] Request: method={method}, has_params={bool(data.get('params'))}")
+
+    # --- JSON-RPC 2.0 handling ---
     if isinstance(data, dict) and data.get("jsonrpc") == "2.0":
         jsonrpc_id = data.get("id")
         method = data.get("method")
         params = data.get("params", {}) or {}
 
-        # Tool discovery
-        if method == "tools/list":
-            result = {"tools": TOOL_DEFINITIONS}
-            return {"jsonrpc": "2.0", "id": jsonrpc_id, "result": result}
-
-        # Initialization handshake
-        # Clients send an ``initialize`` request with a desired protocolVersion
-        # and (optionally) client capabilities. According to the MCP spec,
-        # servers should return the negotiated protocolVersion, declare their
-        # supported capabilities, and may include serverInfo. We reflect
-        # back the requested protocolVersion if provided, defaulting to
-        # today's date if absent.
+        # === INITIALIZE ===
         if method == "initialize":
             requested_proto = None
-            # ``params`` may contain a ``protocolVersion`` requested by the client
-            # and a ``capabilities`` object. We ignore client capabilities for
-            # now and support only tools.
             try:
                 requested_proto = params.get("protocolVersion")
             except Exception:
-                requested_proto = None
-            # Use requested protocol version or current date as fallback
+                pass
+            
             if requested_proto:
                 protocol_version = requested_proto
             else:
                 protocol_version = datetime.utcnow().strftime("%Y-%m-%d")
+            
             capabilities = {
                 "tools": {"listChanged": False},
             }
@@ -778,23 +781,43 @@ async def mcp_invoke(
                 "name": "Zoho Analytics MCP",
                 "version": "0.1.0",
             }
+            
+            result = {
+                "protocolVersion": protocol_version,
+                "capabilities": capabilities,
+                "serverInfo": server_info,
+            }
+            
+            print(f"[MCP] Initialize response: {result}")
+            
             return {
                 "jsonrpc": "2.0",
                 "id": jsonrpc_id,
-                "result": {
-                    "protocolVersion": protocol_version,
-                    "capabilities": capabilities,
-                    "serverInfo": server_info,
-                },
+                "result": result,
             }
-        # Tool execution (within JSON‑RPC handler)
+
+        # === TOOLS/LIST ===
+        if method == "tools/list":
+            result = {"tools": TOOL_DEFINITIONS}
+            print(f"[MCP] Returning {len(TOOL_DEFINITIONS)} tools")
+            return {
+                "jsonrpc": "2.0",
+                "id": jsonrpc_id,
+                "result": result
+            }
+
+        # === TOOLS/CALL ===
         if method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments", {}) or {}
+            
+            print(f"[MCP] Tool call: {name} with args: {list(arguments.keys())}")
+            
             try:
-                # Dispatch to the corresponding helper based on the tool name
+                # Dispatch según el tool
                 if name == "workspaces_v2":
                     result_data = get_workspaces_list()
+                    
                 elif name == "views_v2":
                     workspace_id = arguments.get("workspace_id")
                     if not workspace_id:
@@ -805,12 +828,14 @@ async def mcp_invoke(
                         int(arguments.get("limit", 200)),
                         int(arguments.get("offset", 0)),
                     )
+                    
                 elif name == "view_details_v2":
                     workspace_id = arguments.get("workspace_id")
                     view_id = arguments.get("view_id")
                     if not (workspace_id and view_id):
                         raise ValueError("Missing required parameters: workspace_id and view_id")
                     result_data = get_view_details(workspace_id, view_id)
+                    
                 elif name == "export_view_v2":
                     workspace_id = arguments.get("workspace_id")
                     view = arguments.get("view")
@@ -819,16 +844,30 @@ async def mcp_invoke(
                     limit = int(arguments.get("limit", 100))
                     offset = int(arguments.get("offset", 0))
                     result_data = export_view(workspace_id, view, limit, offset)
+                    
                 elif name == "query_v2":
                     workspace_id = arguments.get("workspace_id")
                     sql = arguments.get("sql")
                     if not (workspace_id and sql):
                         raise ValueError("Missing required parameters: workspace_id and sql")
                     result_data = query_data(workspace_id, sql)
+                    
                 else:
-                    return JSONResponse(status_code=404, content={"jsonrpc": "2.0", "id": jsonrpc_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}})
+                    print(f"[MCP] Unknown tool: {name}")
+                    return JSONResponse(
+                        status_code=404,
+                        content={
+                            "jsonrpc": "2.0",
+                            "id": jsonrpc_id,
+                            "error": {
+                                "code": -32601,
+                                "message": f"Unknown tool: {name}"
+                            }
+                        }
+                    )
 
-                # Return the result as content array per MCP spec
+                # Retornar según spec MCP
+                print(f"[MCP] Tool {name} executed successfully")
                 return {
                     "jsonrpc": "2.0",
                     "id": jsonrpc_id,
@@ -841,25 +880,42 @@ async def mcp_invoke(
                         ]
                     },
                 }
+                
             except Exception as exc:
-                return JSONResponse(status_code=400, content={
-                    "jsonrpc": "2.0",
-                    "id": jsonrpc_id,
-                    "error": {"code": -32000, "message": str(exc)}
-                })
+                print(f"[MCP] Tool execution error: {exc}")
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "id": jsonrpc_id,
+                        "error": {
+                            "code": -32000,
+                            "message": str(exc)
+                        }
+                    }
+                )
 
-        # Unknown method for JSON‑RPC 2.0
-        return JSONResponse(status_code=404, content={
-            "jsonrpc": "2.0",
-            "id": jsonrpc_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"}
-        })
+        # Método desconocido
+        print(f"[MCP] Unknown method: {method}")
+        return JSONResponse(
+            status_code=404,
+            content={
+                "jsonrpc": "2.0",
+                "id": jsonrpc_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
+            }
+        )
 
-    # --- Simple (legacy) invocation format ---
-    # Accept the previous `{action: name, input: {…}}` schema for backward compatibility.
+    # --- Legacy format {action, input} ---
     if isinstance(data, dict) and "action" in data:
         name = data.get("action")
         arguments = data.get("input", {}) or {}
+        
+        print(f"[MCP] Legacy action call: {name}")
+        
         try:
             if name == "workspaces_v2":
                 result_data = get_workspaces_list()
@@ -877,13 +933,13 @@ async def mcp_invoke(
                 workspace_id = arguments.get("workspace_id")
                 view_id = arguments.get("view_id")
                 if not (workspace_id and view_id):
-                    raise ValueError("Missing required parameters: workspace_id and view_id")
+                    raise ValueError("Missing required parameters")
                 result_data = get_view_details(workspace_id, view_id)
             elif name == "export_view_v2":
                 workspace_id = arguments.get("workspace_id")
                 view = arguments.get("view")
                 if not (workspace_id and view):
-                    raise ValueError("Missing required parameters: workspace_id and view")
+                    raise ValueError("Missing required parameters")
                 limit = int(arguments.get("limit", 100))
                 offset = int(arguments.get("offset", 0))
                 result_data = export_view(workspace_id, view, limit, offset)
@@ -891,32 +947,41 @@ async def mcp_invoke(
                 workspace_id = arguments.get("workspace_id")
                 sql = arguments.get("sql")
                 if not (workspace_id and sql):
-                    raise ValueError("Missing required parameters: workspace_id and sql")
+                    raise ValueError("Missing required parameters")
                 result_data = query_data(workspace_id, sql)
             else:
-                return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown action: {name}"})
+                return JSONResponse(
+                    status_code=404,
+                    content={"ok": False, "error": f"Unknown action: {name}"}
+                )
 
             return {"ok": True, "action": name, "result": result_data}
+            
         except Exception as exc:
-            return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+            print(f"[MCP] Legacy action error: {exc}")
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": str(exc)}
+            )
 
-    # If the payload does not match any known format, return an error.
-    return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request"}})
+    # Payload no reconocido
+    print(f"[MCP] Invalid request format")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32600,
+                "message": "Invalid request"
+            }
+        }
+    )
 
-# Support trailing slash in the MCP endpoint. Some MCP clients may
-# invoke ``/mcp/`` instead of ``/mcp``. FastAPI treats these as
-# distinct paths for POST requests, so we register an alias that
-# delegates to the main ``mcp_invoke`` handler.
+# El endpoint /mcp/ (con trailing slash) puede permanecer como alias
 @app.post("/mcp/")
 async def mcp_invoke_alias(
-    payload: Optional[dict] = Body(
-        default=None,
-        description=(
-            "JSON‑RPC request payload. See ``/mcp`` for details."
-        ),
-    ),
+    payload: Optional[dict] = Body(default=None),
     request: Request = None,
 ):
-    # Delegate to the main mcp_invoke handler. We explicitly pass the
-    # payload and request so the logic remains the same.
+    """Alias con trailing slash."""
     return await mcp_invoke(payload=payload, request=request)

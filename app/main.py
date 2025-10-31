@@ -93,7 +93,19 @@ app.add_middleware(
 
 # ======================= OAUTH MÍNIMO (para el conector) =======================
 def _issuer(req: Request) -> str:
-    return f"{req.url.scheme}://{req.url.netloc}"
+    """
+    Devuelve el issuer respetando cabeceras de proxy (Render/Cloudflare).
+    Forzamos https porque la URL pública del conector es con TLS.
+    """
+    proto = (req.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    host  = (req.headers.get("x-forwarded-host")  or "").split(",")[0].strip()
+    if not host:
+        host = req.url.netloc
+    if proto not in ("http", "https"):
+        proto = req.url.scheme or "https"
+    # Importante: devolver SIEMPRE https://<host>
+    return f"https://{host}"
+
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
 def oauth_protected_resource(req: Request):

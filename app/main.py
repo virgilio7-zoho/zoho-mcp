@@ -94,18 +94,20 @@ app.add_middleware(
 # ======================= OAUTH MÍNIMO (para el conector) =======================
 def _issuer(req: Request) -> str:
     """
-    Devuelve el issuer respetando cabeceras de proxy (Render/Cloudflare).
-    Forzamos https porque la URL pública del conector es con TLS.
+    Devuelve el issuer respetando cabeceras de proxy.
+    IMPORTANTE: Siempre retorna HTTPS porque Render usa HTTPS en la URL pública.
     """
+    # Priorizar headers de proxy (Render/Cloudflare)
     proto = (req.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
     host  = (req.headers.get("x-forwarded-host")  or "").split(",")[0].strip()
+    
+    # Fallback a los valores directos de la request
     if not host:
         host = req.url.netloc
-    if proto not in ("http", "https"):
-        proto = req.url.scheme or "https"
-    # Importante: devolver SIEMPRE https://<host>
-    return f"https://{host}"
-
+    if not proto or proto not in ("http", "https"):
+        proto = "https"  # Default a HTTPS para Render
+    
+    return f"{proto}://{host}"
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
 def oauth_protected_resource(req: Request):
@@ -147,37 +149,37 @@ def openid_configuration(req: Request):
         "authorization_response_iss_parameter_supported": True,
     }
 
-
+# ========= CORRECCIÓN: Endpoint /authorize =========
 @app.get("/authorize", include_in_schema=False)
 def oauth_authorize(
     request: Request,
-    response_type: str = Query(...),           # "code"
-    client_id: str = Query(...),               # p.ej., "chatgpt"
+    response_type: str = Query(...),
+    client_id: str = Query(...),
     redirect_uri: str = Query(...),
     scope: str | None = Query(None),
     state: str | None = Query(None),
-    code_challenge: str | None = Query(None),          # tolerante
-    code_challenge_method: str | None = Query(None),   # "S256" | "plain"
+    code_challenge: str | None = Query(None),
+    code_challenge_method: str | None = Query(None),
 ):
     """Consent inmediato y redirección con `code`."""
     if response_type != "code":
         raise HTTPException(status_code=400, detail="unsupported_response_type")
 
-    # código temporal (10 min) atado al cliente y redirect
+    # Código temporal (10 min)
     code = secrets.token_urlsafe(24)
     _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)
 
-    # issuer base (https://tu-dominio)
-    base = f"{request.url.scheme}://{request.url.netloc}"
+    # ✅ USAR _issuer() para consistencia
+    base = _issuer(request)
 
-    # Construir redirect: ?code=... [&state=...] &iss=<issuer>
+    # Construir redirect con iss
     sep = "&" if "?" in redirect_uri else "?"
     final_url = f"{redirect_uri}{sep}code={code}"
     if state:
         final_url += f"&state={state}"
-    # 👇 clave para compatibilidad con algunos clientes (incl. ChatGPT)
     final_url += f"&iss={base}"
 
+    print(f"[OAUTH] Redirecting to: {final_url}")  # Debug
     return RedirectResponse(url=final_url, status_code=302)
 
 
@@ -190,86 +192,146 @@ def _body_value(body: dict, name: str, default=None):
         return v
     return default
 
+# ========= CORRECCIÓN: Endpoint /token - Manejo robusto =========
 @app.post("/token", include_in_schema=False)
 async def oauth_token(request: Request):
+    """
+    Endpoint de intercambio de tokens OAuth 2.0.
+    Soporta grant_type: authorization_code y refresh_token.
+    """
     ctype = (request.headers.get("content-type") or "").lower()
     data: dict = {}
 
+    # Intentar parsear form-urlencoded o multipart
     if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
         try:
             form = await request.form()
             data = dict(form)
-        except Exception:
-            data = {}
+        except Exception as e:
+            print(f"[TOKEN] Error parsing form: {e}")
 
+    # Fallback a JSON
     if not data:
         try:
             data = await request.json()
-        except Exception:
-            data = {}
+        except Exception as e:
+            print(f"[TOKEN] Error parsing JSON: {e}")
 
+    # También revisar query params (algunos clientes los usan)
     qp = dict(request.query_params)
 
     def pick(name: str, default=None):
-        return (data.get(name) or qp.get(name) or default)
+        val = data.get(name) or qp.get(name)
+        # Si es lista (de form), tomar primer elemento
+        if isinstance(val, list) and val:
+            return val[0]
+        return val or default
 
-    grant_type   = pick("grant_type")
-    code         = pick("code")
+    grant_type = pick("grant_type")
+    code = pick("code")
     redirect_uri = pick("redirect_uri", "")
-    client_id    = pick("client_id", "")
-    refresh_tok  = pick("refresh_token")
-    code_verifier = pick("code_verifier")  # lo toleramos, no validamos en este AS mínimo
+    client_id = pick("client_id", "")
+    refresh_tok = pick("refresh_token")
+    code_verifier = pick("code_verifier")
 
-    print({"kind": "token_request", "ctype": ctype, "grant_type": grant_type,
-           "has_code": bool(code), "has_refresh": bool(refresh_tok)})
+    # Log para debugging
+    print({
+        "event": "token_request",
+        "content_type": ctype,
+        "grant_type": grant_type,
+        "has_code": bool(code),
+        "has_refresh": bool(refresh_tok),
+        "client_id": client_id
+    })
 
+    # Validar grant_type
     if grant_type not in ("authorization_code", "refresh_token"):
-        raise HTTPException(status_code=400, detail="unsupported_grant_type")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "unsupported_grant_type", "error_description": f"Grant type '{grant_type}' not supported"}
+        )
 
+    # ========= AUTHORIZATION_CODE FLOW =========
     if grant_type == "authorization_code":
         if not code:
-            raise HTTPException(status_code=400, detail="invalid_request")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_request", "error_description": "Missing 'code' parameter"}
+            )
 
-        data_tuple = _OAUTH_CODES.pop(code, None)
-        if not data_tuple:
-            raise HTTPException(status_code=400, detail="invalid_grant")
+        # Verificar el código
+        code_data = _OAUTH_CODES.pop(code, None)
+        if not code_data:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_grant", "error_description": "Invalid or expired authorization code"}
+            )
 
-        exp_ts, expected_client, expected_redirect = data_tuple
+        exp_ts, expected_client, expected_redirect = code_data
+
+        # Validar expiración
         if exp_ts < time.time():
-            raise HTTPException(status_code=400, detail="invalid_grant")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_grant", "error_description": "Authorization code expired"}
+            )
 
-        access_token  = secrets.token_urlsafe(32)
+        # Generar tokens
+        access_token = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
 
-        _OAUTH_TOKENS[access_token]   = time.time() + ACCESS_TTL_SECONDS
+        _OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
         _OAUTH_REFRESH[refresh_token] = time.time() + (REFRESH_TTL_DAYS * 24 * 3600)
+
+        print(f"[TOKEN] Issued access_token (expires in {ACCESS_TTL_SECONDS}s)")
 
         return {
             "token_type": "Bearer",
             "access_token": access_token,
             "expires_in": ACCESS_TTL_SECONDS,
             "refresh_token": refresh_token,
-            "scope": "default",
+            "scope": "default offline_access",
         }
 
+    # ========= REFRESH_TOKEN FLOW =========
     elif grant_type == "refresh_token":
         if not refresh_tok:
-            raise HTTPException(status_code=400, detail="invalid_request")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_request", "error_description": "Missing 'refresh_token' parameter"}
+            )
 
         exp = _OAUTH_REFRESH.get(refresh_tok)
         if not exp or exp < time.time():
-            raise HTTPException(status_code=400, detail="invalid_grant")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_grant", "error_description": "Invalid or expired refresh token"}
+            )
 
+        # Generar nuevo access token
         access_token = secrets.token_urlsafe(32)
         _OAUTH_TOKENS[access_token] = time.time() + ACCESS_TTL_SECONDS
+
+        print(f"[TOKEN] Refreshed access_token")
 
         return {
             "token_type": "Bearer",
             "access_token": access_token,
             "expires_in": ACCESS_TTL_SECONDS,
-            "refresh_token": refresh_tok,
-            "scope": "default",
+            "refresh_token": refresh_tok,  # Mantener el mismo refresh token
+            "scope": "default offline_access",
         }
+
+# ========= ADICIONAL: Endpoint de debug =========
+@app.get("/debug/oauth-state", include_in_schema=False)
+def debug_oauth_state():
+    """Endpoint para debugging (REMOVER EN PRODUCCIÓN)"""
+    return {
+        "active_codes": len(_OAUTH_CODES),
+        "active_tokens": len(_OAUTH_TOKENS),
+        "active_refresh": len(_OAUTH_REFRESH),
+        "issuer_example": "Use _issuer() with a Request object"
+    }
 @app.get("/", include_in_schema=False)
 def root():
     """

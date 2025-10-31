@@ -116,6 +116,7 @@ def oauth_authorization_server(req: Request):
         "scopes_supported": ["default", "offline_access"],
         "code_challenge_methods_supported": ["S256", "plain"],
         "token_endpoint_auth_methods_supported": ["none"],   # <- clave para este flujo
+        "authorization_response_iss_parameter_supported": True,
     }
 
 @app.get("/.well-known/openid-configuration", include_in_schema=False)
@@ -131,6 +132,7 @@ def openid_configuration(req: Request):
         "scopes_supported": ["default", "offline_access"],
         "code_challenge_methods_supported": ["S256", "plain"],
         "token_endpoint_auth_methods_supported": ["none"],
+        "authorization_response_iss_parameter_supported": True,
     }
 
 
@@ -149,17 +151,21 @@ def oauth_authorize(
     if response_type != "code":
         raise HTTPException(status_code=400, detail="unsupported_response_type")
 
-    # Emitir authorization_code y guardarlo por 10 minutos
+    # código temporal (10 min) atado al cliente y redirect
     code = secrets.token_urlsafe(24)
     _OAUTH_CODES[code] = (time.time() + 600, client_id, redirect_uri)
 
-    # Construir la URL final con ?code= y state (si viene)
+    # issuer base (https://tu-dominio)
+    base = f"{request.url.scheme}://{request.url.netloc}"
+
+    # Construir redirect: ?code=... [&state=...] &iss=<issuer>
     sep = "&" if "?" in redirect_uri else "?"
     final_url = f"{redirect_uri}{sep}code={code}"
     if state:
         final_url += f"&state={state}"
+    # 👇 clave para compatibilidad con algunos clientes (incl. ChatGPT)
+    final_url += f"&iss={base}"
 
-    # IMPORTANTE: redirigir con 302 (no 307)
     return RedirectResponse(url=final_url, status_code=302)
 
 
@@ -174,15 +180,9 @@ def _body_value(body: dict, name: str, default=None):
 
 @app.post("/token", include_in_schema=False)
 async def oauth_token(request: Request):
-    """
-    Canjea authorization_code por access_token o refresh_token por uno nuevo.
-    Parseo robusto: form-url-encoded, JSON o querystring.
-    """
-    # 1) Parseo del body
     ctype = (request.headers.get("content-type") or "").lower()
     data: dict = {}
 
-    # a) Intentar como form
     if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
         try:
             form = await request.form()
@@ -190,14 +190,12 @@ async def oauth_token(request: Request):
         except Exception:
             data = {}
 
-    # b) Si no había form, intentar JSON
     if not data:
         try:
             data = await request.json()
         except Exception:
             data = {}
 
-    # c) También aceptamos parámetros por query (útil para debug)
     qp = dict(request.query_params)
 
     def pick(name: str, default=None):
@@ -208,20 +206,18 @@ async def oauth_token(request: Request):
     redirect_uri = pick("redirect_uri", "")
     client_id    = pick("client_id", "")
     refresh_tok  = pick("refresh_token")
+    code_verifier = pick("code_verifier")  # lo toleramos, no validamos en este AS mínimo
 
-    # Logging mínimo (una línea)
     print({"kind": "token_request", "ctype": ctype, "grant_type": grant_type,
            "has_code": bool(code), "has_refresh": bool(refresh_tok)})
 
     if grant_type not in ("authorization_code", "refresh_token"):
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
-    # ================= authorization_code =================
     if grant_type == "authorization_code":
         if not code:
             raise HTTPException(status_code=400, detail="invalid_request")
 
-        # Buscar el code emitido en /authorize
         data_tuple = _OAUTH_CODES.pop(code, None)
         if not data_tuple:
             raise HTTPException(status_code=400, detail="invalid_grant")
@@ -229,8 +225,6 @@ async def oauth_token(request: Request):
         exp_ts, expected_client, expected_redirect = data_tuple
         if exp_ts < time.time():
             raise HTTPException(status_code=400, detail="invalid_grant")
-
-        # (Opcional) validar client_id/redirect_uri aquí…
 
         access_token  = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
@@ -246,7 +240,6 @@ async def oauth_token(request: Request):
             "scope": "default",
         }
 
-    # ================= refresh_token =================
     elif grant_type == "refresh_token":
         if not refresh_tok:
             raise HTTPException(status_code=400, detail="invalid_request")
@@ -262,7 +255,7 @@ async def oauth_token(request: Request):
             "token_type": "Bearer",
             "access_token": access_token,
             "expires_in": ACCESS_TTL_SECONDS,
-            "refresh_token": refresh_tok,  # mantenemos el mismo refresh
+            "refresh_token": refresh_tok,
             "scope": "default",
         }
 
